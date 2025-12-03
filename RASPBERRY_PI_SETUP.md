@@ -36,20 +36,42 @@ sudo apt-get install -y \
 
 ### 3. Install SDRplay Support (if using SDRplay RSP1)
 
+**Important:** The SDRplay API must be installed and the service must be running before you can use your RSP device.
+
 ```bash
-# Download and install SDRplay API
-wget https://www.sdrplay.com/software/SDRplay_RSP_API-Linux-3.15.2.run
-chmod +x SDRplay_RSP_API-Linux-3.15.2.run
-sudo ./SDRplay_RSP_API-Linux-3.15.2.run
+# Download and install SDRplay API for ARM32 (Raspberry Pi)
+wget https://www.sdrplay.com/software/SDRplay_RSP_API-ARM32-3.15.2.run
+chmod +x SDRplay_RSP_API-ARM32-3.15.2.run
+sudo ./SDRplay_RSP_API-ARM32-3.15.2.run
+
+# Start and enable the SDRplay service
+sudo systemctl start sdrplay
+sudo systemctl enable sdrplay
+
+# Verify the service is running
+sudo systemctl status sdrplay
 
 # Install SoapySDR plugin for SDRplay
 sudo apt-get install -y soapysdr-module-sdrplay3
+
+# Verify your device is detected
+SoapySDRUtil --find="driver=sdrplay"
 ```
 
 ### 4. Install Python Dependencies
 
+**Note:** On Raspberry Pi OS, numpy and SoapySDR should be installed via apt for better compatibility.
+
 ```bash
-pip3 install flask flask-socketio numpy SoapySDR
+# Install Python packages via apt (recommended for Pi)
+sudo apt-get install -y python3-numpy python3-soapysdr
+
+# Create virtual environment with system packages
+python3 -m venv --system-site-packages venv
+source venv/bin/activate
+
+# Install Flask packages in venv
+pip install flask flask-socketio
 ```
 
 ### 5. Build Direwolf
@@ -145,9 +167,22 @@ Edit the default configuration in `scripts/web_interface.py` or use the web UI:
 # Check USB devices
 lsusb
 
+# Check if SDRplay service is running
+sudo systemctl status sdrplay
+
+# If not running, start it
+sudo systemctl start sdrplay
+
 # Check SoapySDR detection
+SoapySDRUtil --find="driver=sdrplay"
+
+# Detailed probe
 SoapySDRUtil --probe="driver=sdrplay"
 ```
+
+**Common error:** `shm_open: No such file or directory`
+- This means the SDRplay API service is not running
+- Solution: `sudo systemctl start sdrplay`
 
 ### Permission Issues with SDR
 

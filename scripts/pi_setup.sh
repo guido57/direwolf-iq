@@ -27,13 +27,41 @@ sudo apt-get install -y \
     libasound2-dev \
     python3 \
     python3-pip \
+    python3-numpy \
     csdr \
     libsoapysdr-dev \
-    soapysdr-tools
+    soapysdr-tools \
+    python3-soapysdr
+
+echo ""
+echo "Step 1a: Installing SDRplay API (if using SDRplay RSP devices)..."
+read -p "Do you have an SDRplay RSP device? (y/n) " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    if ! systemctl is-active --quiet sdrplay 2>/dev/null; then
+        echo "SDRplay API not detected. Please install it manually:"
+        echo "  1. Download from: https://www.sdrplay.com/downloads/"
+        echo "  2. Look for: SDRplay_RSP_API-ARM32-3.15.2.run (or latest version)"
+        echo "  3. Run: sudo ./SDRplay_RSP_API-ARM32-3.15.2.run"
+        echo "  4. Start service: sudo systemctl start sdrplay"
+        echo "  5. Enable on boot: sudo systemctl enable sdrplay"
+        echo ""
+        read -p "Press Enter to continue setup without SDRplay API (you can install it later)..."
+    else
+        echo "SDRplay API service is running."
+        sudo systemctl enable sdrplay
+    fi
+fi
 
 echo ""
 echo "Step 2: Installing Python dependencies..."
-pip3 install --user flask flask-socketio numpy SoapySDR
+echo "Creating Python virtual environment..."
+python3 -m venv --system-site-packages venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install flask flask-socketio
+echo "Note: numpy and SoapySDR are installed system-wide via apt for better compatibility"
+echo "To activate the virtual environment in the future, run: source venv/bin/activate"
 
 echo ""
 echo "Step 3: Building Direwolf..."
@@ -60,9 +88,14 @@ echo "=========================================="
 echo ""
 echo "To start the web interface manually:"
 echo "  cd $(pwd)/.."
+echo "  source venv/bin/activate"
 echo "  python3 scripts/web_interface.py"
 echo ""
 echo "Then access it at: http://$(hostname -I | awk '{print $1}'):5000"
+echo ""
+echo "IMPORTANT: If you're using an SDRplay RSP device, make sure:"
+echo "  1. SDRplay API service is running: sudo systemctl status sdrplay"
+echo "  2. Device is detected: SoapySDRUtil --find='driver=sdrplay'"
 echo ""
 
 read -p "Would you like to create a systemd service for auto-start? (y/n) " -n 1 -r
@@ -75,13 +108,13 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     sudo tee $SERVICE_FILE > /dev/null <<EOF
 [Unit]
 Description=Direwolf Web Interface
-After=network.target
+After=network.target sdrplay.service
 
 [Service]
 Type=simple
 User=$USER
 WorkingDirectory=$INSTALL_DIR
-ExecStart=/usr/bin/python3 $INSTALL_DIR/scripts/web_interface.py
+ExecStart=$INSTALL_DIR/venv/bin/python3 $INSTALL_DIR/scripts/web_interface.py
 Restart=on-failure
 RestartSec=10
 
