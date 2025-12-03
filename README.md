@@ -96,6 +96,10 @@ It can also be used as a virtual TNC for other applications such as [APRSIS32](h
   
     Direct IQ input from SDR sources (rx_sdr, csdr, etc.) with built-in FM demodulation. Eliminates need for external FM demodulation tools. See [IQ_INPUT.md](IQ_INPUT.md) for details.
 
+- **Web Interface with Live Charts.**
+  
+    A lightweight Flask-based web UI (branch `web_interface`) provides real-time RSSI/SNR charts and station statistics. Chart tooltips show Callsign, Via (Direct or last digipeater), and timestamp when hovering points. See `scripts/web_interface.py` and `scripts/templates/index.html`.
+
 - **Concurrent operation with up to 3 soundcards and 6 radios.**
 
 ### Portable & Open Source:
