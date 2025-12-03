@@ -265,7 +265,7 @@
                         <div>SNR</div>
                         <div>Count</div>
                         <div>Last Heard</div>
-                        <div>Last Digipeater</div>
+                        <div>Via</div>
                     </div>
                     <div id="stationList"></div>
                 </div>
@@ -429,17 +429,18 @@
             const list = document.getElementById('stationList');
             
             list.innerHTML = stations.map(s => {
-                const lastHeard = new Date(s.last_seen).toLocaleTimeString();
+                const lastHeard = s.last_seen ? new Date(s.last_seen).toLocaleTimeString() : '-';
+                const isDirect = (s.via === 'Direct');
                 return `
                 <div class="station-item">
                     <div>${s.callsign}</div>
-                    <div>${s.rssi ? s.rssi.toFixed(1) : '-'}</div>
-                    <div>${s.snr ? s.snr.toFixed(1) : '-'}</div>
+                    <div>${s.rssi !== null && s.rssi !== undefined ? s.rssi.toFixed(1) : '-'}</div>
+                    <div>${s.snr !== null && s.snr !== undefined ? s.snr.toFixed(1) : '-'}</div>
                     <div>${s.count}</div>
                     <div style="color:#999;font-size:12px">${lastHeard}</div>
                     <div>
-                        <span class="${s.last_digipeater === 'Direct' ? 'direct-badge' : 'digipeated-badge'}">
-                            ${s.last_digipeater || 'Unknown'}
+                        <span class="${isDirect ? 'direct-badge' : 'digipeated-badge'}">
+                            ${s.via}
                         </span>
                     </div>
                 </div>
