@@ -44,7 +44,12 @@ stats = {
     'last_packets': deque(maxlen=50),
     'rssi_history': deque(maxlen=100),
     'snr_history': deque(maxlen=100),
-    'station_list': {}  # callsign: {'rssi', 'snr', 'count', 'last_seen', 'direct'}
+    # station_list structure:
+    # callsign: {
+    #   'direct': {'count', 'last_seen', 'rssi', 'snr'},
+    #   'via': { digipeater: {'count', 'last_seen', 'rssi', 'snr'} }
+    # }
+    'station_list': {}
 }
 
 def parse_direwolf_line(line):
@@ -129,28 +134,27 @@ def pipeline_reader(process):
             if packet['direct']:
                 stats['direct_rf_senders'].add(sender)
             
-            # Update station list (using original sender, not digipeater)
+            # Initialize station entry if needed
             if sender not in stats['station_list']:
                 stats['station_list'][sender] = {
                     'first_seen': packet['timestamp'],
-                    'count': 0,
-                    'direct': packet['direct'],
-                    'last_digipeater': packet['last_digipeater']
+                    'direct': {'count': 0, 'last_seen': None, 'rssi': None, 'snr': None},
+                    'via': {}
                 }
-            
-            # Update with latest metrics and increment count
-            stats['station_list'][sender].update({
-                'rssi': packet['rssi'],
-                'snr': packet['snr'],
-                'last_seen': packet['timestamp'],
-                'count': stats['station_list'][sender]['count'] + 1,
-                'last_digipeater': packet['last_digipeater']
-            })
-            
-            # Keep track if we've ever heard this station directly
+
+            # Update direct or via-digipeater bucket
             if packet['direct']:
-                stats['station_list'][sender]['direct'] = True
-                stats['station_list'][sender]['last_digipeater'] = 'Direct'
+                bucket = stats['station_list'][sender]['direct']
+            else:
+                digi = packet['last_digipeater'] or 'Unknown'
+                if digi not in stats['station_list'][sender]['via']:
+                    stats['station_list'][sender]['via'][digi] = {'count': 0, 'last_seen': None, 'rssi': None, 'snr': None}
+                bucket = stats['station_list'][sender]['via'][digi]
+
+            bucket['count'] = bucket['count'] + 1
+            bucket['last_seen'] = packet['timestamp']
+            bucket['rssi'] = packet['rssi']
+            bucket['snr'] = packet['snr']
             
             # Update metrics history
             if packet['rssi'] is not None:
@@ -183,16 +187,27 @@ def start_pipeline():
             # Build command
             filter_arg = '4 0.005 HAMMING' if config['filter_quality'] == 'high' else '4'
             
-            cmd = [
-                'bash', '-c',
+            # Build sdrplay command parts
+            sdr_cmd = (
                 f"python3 scripts/sdrplay_to_direwolf.py "
                 f"--freq {config['frequency']} "
                 f"--ifgr {config['ifgr']} "
-                f"--rfgr {config['rfgr']} "
-                f"{'--agc' if config['agc'] else ''} 2>/dev/null | "
+                f"--rfgr {config['rfgr']}"
+            )
+            
+            # Add --agc flag if enabled
+            if config['agc']:
+                sdr_cmd += " --agc"
+            
+            full_cmd = (
+                f"{sdr_cmd} 2>/dev/null | "
                 f"csdr fir_decimate_cc {filter_arg} 2>/dev/null | "
                 f"./build/src/direwolf -M -t 0 -r 48000 -n 1 iq:48000 2>&1"
-            ]
+            )
+            
+            print(f"Starting pipeline with command: {full_cmd}")
+            
+            cmd = ['bash', '-c', full_cmd]
             
             pipeline_process = subprocess.Popen(
                 cmd,
@@ -257,6 +272,8 @@ def update_config():
     global config
     data = request.json
     
+    print(f"Received config update: {data}")
+    
     # Update config
     if 'frequency' in data:
         config['frequency'] = float(data['frequency'])
@@ -268,6 +285,8 @@ def update_config():
         config['agc'] = bool(data['agc'])
     if 'filter_quality' in data:
         config['filter_quality'] = data['filter_quality']
+    
+    print(f"Updated config: {config}")
     
     # Restart pipeline if running
     if pipeline_running:
@@ -295,18 +314,32 @@ def api_get_packets():
 
 @app.route('/api/stations', methods=['GET'])
 def api_get_stations():
-    station_data = []
-    for callsign, info in sorted(stats['station_list'].items(), key=lambda x: x[1]['last_seen'], reverse=True):
-        station_data.append({
-            'callsign': callsign,
-            'rssi': info.get('rssi'),
-            'snr': info.get('snr'),
-            'count': info['count'],
-            'last_seen': info['last_seen'],
-            'direct': info['direct'],
-            'last_digipeater': info.get('last_digipeater', 'Unknown')
-        })
-    return jsonify(station_data)
+    # Flatten into separate lines for direct and each digipeater
+    station_rows = []
+    for callsign, entry in stats['station_list'].items():
+        # Direct row
+        if entry['direct']['count'] > 0:
+            station_rows.append({
+                'callsign': callsign,
+                'via': 'Direct',
+                'count': entry['direct']['count'],
+                'last_seen': entry['direct']['last_seen'],
+                'rssi': entry['direct']['rssi'],
+                'snr': entry['direct']['snr']
+            })
+        # Via rows
+        for digi, info in entry['via'].items():
+            station_rows.append({
+                'callsign': callsign,
+                'via': digi,
+                'count': info['count'],
+                'last_seen': info['last_seen'],
+                'rssi': info['rssi'],
+                'snr': info['snr']
+            })
+    # Sort by last_seen desc
+    station_rows.sort(key=lambda r: r['last_seen'] or '', reverse=True)
+    return jsonify(station_rows)
 
 @app.route('/api/metrics', methods=['GET'])
 def api_get_metrics():
