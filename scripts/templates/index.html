@@ -280,6 +280,8 @@
     <script>
         const socket = io();
         let rssiChart, snrChart;
+        const rssiMeta = [];
+        const snrMeta = [];
         
         // Initialize charts
         const chartConfig = {
@@ -296,7 +298,23 @@
                     }
                 },
                 plugins: {
-                    legend: { display: false }
+                    legend: { display: false },
+                    tooltip: {
+                        callbacks: {
+                            label: (ctx) => {
+                                const val = ctx.parsed.y;
+                                return `${ctx.dataset.label}: ${val !== undefined ? val.toFixed(1) : '-'}`;
+                            },
+                            afterBody: (items) => {
+                                if (!items || !items.length) return '';
+                                const idx = items[0].dataIndex;
+                                const metaArr = items[0].dataset.label === 'RSSI' ? rssiMeta : snrMeta;
+                                const meta = metaArr[idx];
+                                if (!meta) return '';
+                                return [`Callsign: ${meta.callsign}`, `Via: ${meta.via}`, `Time: ${meta.time}`];
+                            }
+                        }
+                    }
                 }
             }
         };
@@ -329,11 +347,50 @@
             }
         });
         
+        // Helpers
+        function deriveViaFromPacket(packet) {
+            // Prefer backend logic used by Station List
+            if (packet && typeof packet.direct === 'boolean') {
+                if (packet.direct) return 'Direct';
+                if (packet.last_digipeater) return packet.last_digipeater;
+            }
+            // Fallback: parse from path (last hop with *)
+            const path = packet && packet.path ? String(packet.path) : '';
+            if (!path) return 'Direct';
+            const parts = path.split(',');
+            for (let i = parts.length - 1; i >= 0; i--) {
+                const p = parts[i];
+                if (p.includes('*')) return p.replace('*', '');
+            }
+            return 'Direct';
+        }
+
+        function pushChartPoint(chart, metaArr, value, packet) {
+            chart.data.labels.push('');
+            chart.data.datasets[0].data.push(value);
+            const via = deriveViaFromPacket(packet);
+            metaArr.push({
+                callsign: packet.sender || '-',
+                via,
+                time: packet.timestamp ? new Date(packet.timestamp).toLocaleTimeString() : '-'
+            });
+            if (chart.data.labels.length > 50) {
+                chart.data.labels.shift();
+                chart.data.datasets[0].data.shift();
+                metaArr.shift();
+            }
+            chart.update('none');
+        }
+
         // Socket events
         socket.on('new_packet', (packet) => {
             addPacketToLog(packet);
-            if (packet.rssi) updateChart(rssiChart, packet.rssi);
-            if (packet.snr) updateChart(snrChart, packet.snr);
+            if (packet.rssi !== undefined && packet.rssi !== null) {
+                pushChartPoint(rssiChart, rssiMeta, packet.rssi, packet);
+            }
+            if (packet.snr !== undefined && packet.snr !== null) {
+                pushChartPoint(snrChart, snrMeta, packet.snr, packet);
+            }
         });
         
         socket.on('stats_update', (stats) => {
@@ -343,15 +400,7 @@
             updatePipelineStatus(stats.pipeline_running);
         });
         
-        function updateChart(chart, value) {
-            chart.data.labels.push('');
-            chart.data.datasets[0].data.push(value);
-            if (chart.data.labels.length > 50) {
-                chart.data.labels.shift();
-                chart.data.datasets[0].data.shift();
-            }
-            chart.update('none');
-        }
+        // obsolete: updateChart replaced by pushChartPoint
         
         function addPacketToLog(packet) {
             const log = document.getElementById('packetLog');
