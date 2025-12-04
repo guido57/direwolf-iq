@@ -20,41 +20,41 @@ The web interface is a Flask-based real-time monitoring system for direwolf APRS
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ Client Browser (Flask frontend)                              │
+│ Client Browser (Flask frontend)                             │
 │ - index.html: UI with Chart.js graphs                       │
 │ - WebSocket listeners for real-time updates                 │
 └────────────────────────┬────────────────────────────────────┘
                          │ Flask-SocketIO
                          │ (Port 5000)
 ┌────────────────────────┴────────────────────────────────────┐
-│ web_interface.py (Flask Backend)                             │
-│ ┌──────────────────────────────────────────────────────┐   │
-│ │ HTTP Routes:                                         │   │
-│ │ - /api/config: Get/update SDR parameters            │   │
-│ │ - /api/pipeline/start|stop: Control SDR stream      │   │
-│ │ - /api/stats: Get packet/station counts             │   │
-│ │ - /api/packets: Recent packets                       │   │
-│ │ - /api/stations: Station list with via tracking     │   │
-│ │ - /api/metrics: RSSI/SNR history                    │   │
-│ └──────────────────────────────────────────────────────┘   │
-│                                                              │
-│ ┌──────────────────────────────────────────────────────┐   │
-│ │ Threads:                                             │   │
-│ │ - pipeline_reader: Parses direwolf output           │   │
-│ │ - continuous_rssi_monitor: FIFO-based RSSI reading  │   │
-│ │ - socketio.emit: Real-time updates to clients       │   │
-│ └──────────────────────────────────────────────────────┘   │
-│                                                              │
-│ ┌──────────────────────────────────────────────────────┐   │
-│ │ Global State:                                        │   │
-│ │ - config: SDR params (frequency, gains)             │   │
-│ │ - stats: packets, stations, RSSI history            │   │
-│ │ - pipeline_running: Boolean flag                    │   │
-│ └──────────────────────────────────────────────────────┘   │
-└────────────┬─────────────────────────┬───────────────────────┘
+│ web_interface.py (Flask Backend)                            │
+│ ┌──────────────────────────────────────────────────────┐    │
+│ │ HTTP Routes:                                         │    │
+│ │ - /api/config: Get/update SDR parameters             │    │
+│ │ - /api/pipeline/start|stop: Control SDR stream       │    │
+│ │ - /api/stats: Get packet/station counts              │    │
+│ │ - /api/packets: Recent packets                       │    │
+│ │ - /api/stations: Station list with via tracking      │    │
+│ │ - /api/metrics: RSSI/SNR history                     │    │
+│ └──────────────────────────────────────────────────────┘    │
+│                                                             │
+│ ┌──────────────────────────────────────────────────────┐    │
+│ │ Threads:                                             │    │
+│ │ - pipeline_reader: Parses direwolf output            │    │
+│ │ - continuous_rssi_monitor: FIFO-based RSSI reading   │    │
+│ │ - socketio.emit: Real-time updates to clients        │    │
+│ └──────────────────────────────────────────────────────┘    │
+│                                                             │
+│ ┌──────────────────────────────────────────────────────┐    │
+│ │ Global State:                                        │    │
+│ │ - config: SDR params (frequency, gains)              │    │
+│ │ - stats: packets, stations, RSSI history             │    │
+│ │ - pipeline_running: Boolean flag                     │    │
+│ └──────────────────────────────────────────────────────┘    │
+└────────────┬─────────────────────────┬──────────────────────┘
              │                         │
-    ┌────────┘                         └──────────┐
-    │                                             │
+    ┌────────┘                         └────────┐
+    │                                           │
 ┌───▼─────────────────────────────┐    ┌────────▼──────────────┐
 │ IQ Stream Pipeline              │    │ Monitoring FIFO       │
 │                                 │    │ /tmp/direwolf_iq_     │
@@ -62,10 +62,10 @@ The web interface is a Flask-based real-time monitoring system for direwolf APRS
 │ ↓ (192 kHz CF32)                │    │                       │
 │ csdr fir_decimate_cc 8          │    │ Splits IQ stream      │
 │ ↓ (24 kHz CF32)                 │    │ for RSSI computation  │
-│ tee /tmp/direwolf_iq_monitor.   ├───→ (See continuous_rssi_ │
-│     fifo                         │    │  monitor thread)      │
+│ tee /tmp/direwolf_iq_monitor.   ├───→ (See continuous_rssi_  │
+│     fifo                        │    │  monitor thread)      │
 │ ↓                               │    │                       │
-│ direwolf -M -t 0 -r 24000       │    └─────────────────────┘
+│ direwolf -M -t 0 -r 24000       │    └───────────────────────┘
 │          -n 1 iq:24000          │
 │ ↓                               │
 │ APRS Packets                    │
