@@ -15,6 +15,7 @@ import threading
 import re
 import json
 import time
+import os
 from datetime import datetime
 from collections import defaultdict, deque
 
@@ -28,12 +29,15 @@ pipeline_running = False
 pipeline_lock = threading.Lock()
 
 # Configuration
+# Now uses SoapySDR config files for multi-device support
 config = {
-    'frequency': 144.8,
-    'ifgr': 23,
-    'rfgr': 0,
+    'device': 'rtlsdr',  # Device type: 'rtlsdr', 'sdrplay', 'airspy', 'hackrf'
+    'frequency': 144.825,
+    'sample_rate': 1024000,  # RTL-SDR: 1.024M, SDRplay: 192k
+    'gain': 40.0,  # Device-specific (RTL-SDR TUNER: 0-50 dB, SDRplay IFGR: 20-59 dB)
     'agc': False,
-    'filter_quality': 'high'  # 'standard' or 'high'
+    'filter_quality': 'high',  # 'standard' or 'high'
+    'decimation': 64  # Calculated based on sample rate
 }
 
 # Statistics
@@ -119,6 +123,41 @@ def parse_audio_level(line):
     if match:
         return int(match.group(1))
     return None
+
+def generate_soapysdr_config():
+    """Generate a temporary SoapySDR config file from current settings."""
+    config_path = '/tmp/web_interface_sdr.conf'
+    
+    # Determine sample rate decimation for output
+    # After decimation, want ~24kHz output
+    decimation = max(1, int(config['sample_rate'] / 24000))
+    
+    # Build config content
+    config_content = f"""# Auto-generated config for web interface
+DEVICE driver={config['device']}
+FREQUENCY {config['frequency']}
+SAMPLE_RATE {config['sample_rate']}
+AGC {str(config['agc']).lower()}
+"""
+    
+    # Add device-specific gain parameter
+    if config['device'] == 'rtlsdr':
+        config_content += f"GAIN TUNER {config['gain']}\n"
+    elif config['device'] == 'sdrplay':
+        # SDRplay uses IFGR (IF Gain Reduction) and RFGR (RF Gain Reduction)
+        # For compatibility, map gain to IFGR
+        ifgr = max(20, min(59, int(config['gain'])))
+        config_content += f"GAIN IFGR {ifgr}\nGAIN RFGR 0\n"
+    elif config['device'] == 'airspy':
+        config_content += f"GAIN LINEARITY {config['gain']}\n"
+    elif config['device'] == 'hackrf':
+        config_content += f"GAIN LNA {config['gain']}\n"
+    
+    # Write config file
+    with open(config_path, 'w') as f:
+        f.write(config_content)
+    
+    return config_path
 
 def enhance_packet_with_peak_rssi(packet):
     """Replace direwolf's RSSI with peak value from continuous monitoring."""
@@ -326,7 +365,6 @@ def start_pipeline():
         try:
             # Create named pipe for monitoring
             monitor_fifo = '/tmp/direwolf_iq_monitor.fifo'
-            import os
             try:
                 if os.path.exists(monitor_fifo):
                     os.remove(monitor_fifo)
@@ -335,30 +373,30 @@ def start_pipeline():
             except Exception as e:
                 print(f"Warning: couldn't create FIFO: {e}")
             
-            # Build command (decimate by 8 to lower bandwidth)
-            filter_arg = '8 0.005 HAMMING' if config['filter_quality'] == 'high' else '8'
+            # Generate SoapySDR config file
+            sdr_config = generate_soapysdr_config()
+            print(f"Generated SoapySDR config: {sdr_config}")
             
-            # Build sdrplay command parts
-            sdr_cmd = (
-                f"python3 scripts/sdrplay_to_direwolf.py "
-                f"--freq {config['frequency']} "
-                f"--ifgr {config['ifgr']} "
-                f"--rfgr {config['rfgr']}"
-            )
+            # Calculate decimation and output rate
+            decimation = max(1, int(config['sample_rate'] / 24000))
+            output_rate = config['sample_rate'] // decimation
             
-            # Add --agc flag if enabled
-            if config['agc']:
-                sdr_cmd += " --agc"
+            # Build command with generic SoapySDR interface
+            filter_arg = f"{decimation} 0.005 HAMMING" if config['filter_quality'] == 'high' else str(decimation)
+            
+            # Use soapysdr_to_direwolf.py for multi-device support
+            sdr_cmd = f"python3 scripts/soapysdr_to_direwolf.py --config {sdr_config}"
             
             # Add tee after decimation (at direwolf input) for accurate RSSI measurement
             full_cmd = (
                 f"{sdr_cmd} 2>/dev/null | "
                 f"csdr fir_decimate_cc {filter_arg} 2>/dev/null | "
                 f"tee {monitor_fifo} | "
-                f"./build/src/direwolf -M -t 0 -r 24000 -n 1 iq:24000 2>&1"
+                f"./build/src/direwolf -M -t 0 -r {output_rate} -n 1 iq:{output_rate} 2>&1"
             )
             
             print(f"Starting pipeline with command: {full_cmd}")
+            print(f"Config: device={config['device']}, freq={config['frequency']}, sample_rate={config['sample_rate']}, decimation={decimation}")
             
             cmd = ['bash', '-c', full_cmd]
             
@@ -439,17 +477,22 @@ def update_config():
     
     print(f"Received config update: {data}")
     
-    # Update config
+    # Update config (supports multi-device parameters)
+    if 'device' in data:
+        config['device'] = data['device']
     if 'frequency' in data:
         config['frequency'] = float(data['frequency'])
-    if 'ifgr' in data:
-        config['ifgr'] = int(data['ifgr'])
-    if 'rfgr' in data:
-        config['rfgr'] = int(data['rfgr'])
+    if 'sample_rate' in data:
+        config['sample_rate'] = int(data['sample_rate'])
+    if 'gain' in data:
+        config['gain'] = float(data['gain'])
     if 'agc' in data:
         config['agc'] = bool(data['agc'])
     if 'filter_quality' in data:
         config['filter_quality'] = data['filter_quality']
+    
+    # Recalculate decimation
+    config['decimation'] = max(1, int(config['sample_rate'] / 24000))
     
     print(f"Updated config: {config}")
     
