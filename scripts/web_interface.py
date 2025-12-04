@@ -44,6 +44,8 @@ stats = {
     'last_packets': deque(maxlen=50),
     'rssi_history': deque(maxlen=100),
     'snr_history': deque(maxlen=100),
+    'continuous_rssi': deque(maxlen=600),  # 60 seconds at 100ms (10 samples/sec)
+    'last_audio_level': 0,
     # station_list structure:
     # callsign: {
     #   'direct': {'count', 'last_seen', 'rssi', 'snr'},
@@ -109,6 +111,74 @@ def parse_direwolf_line(line):
         'last_digipeater': last_digipeater
     }
 
+def parse_audio_level(line):
+    """Parse direwolf audio level output for continuous monitoring."""
+    # Example: "IW5ALZ-12 audio level = 61(6/6)    ||||||___"
+    # Also: "Digipeater IR5AE audio level = 155(9/9)"
+    match = re.search(r'audio level = (\d+)', line)
+    if match:
+        return int(match.group(1))
+    return None
+
+def enhance_packet_with_peak_rssi(packet):
+    """Replace direwolf's RSSI with peak value from continuous monitoring."""
+    global stats
+    
+    if not packet or not packet.get('timestamp'):
+        return packet
+    
+    continuous = list(stats['continuous_rssi'])
+    if len(continuous) < 2:
+        return packet  # Not enough data yet
+    
+    try:
+        packet_time = datetime.fromisoformat(packet['timestamp'])
+    except:
+        return packet
+    
+    # Find closest sample to packet timestamp
+    min_delta = float('inf')
+    center_idx = -1
+    
+    for i, sample in enumerate(continuous):
+        try:
+            sample_time = datetime.fromisoformat(sample['time'])
+            delta = abs((sample_time - packet_time).total_seconds())
+            if delta < min_delta:
+                min_delta = delta
+                center_idx = i
+        except:
+            continue
+    
+    # Require match within 500ms
+    if center_idx == -1 or min_delta > 0.5:
+        return packet
+    
+    # Search for peak in ±500ms window (~5 samples at 100ms)
+    window_size = 5
+    start_idx = max(0, center_idx - window_size)
+    end_idx = min(len(continuous) - 1, center_idx + window_size)
+    
+    peak_rssi = continuous[center_idx]['value']
+    for i in range(start_idx, end_idx + 1):
+        if continuous[i]['value'] > peak_rssi:
+            peak_rssi = continuous[i]['value']
+    
+    # Replace RSSI with peak value
+    # SNR can be approximated as: peak_rssi - noise_floor
+    # Estimate noise floor from the minimum in a wider window
+    noise_window = 20  # ~2 seconds
+    noise_start = max(0, center_idx - noise_window)
+    noise_end = min(len(continuous) - 1, center_idx + noise_window)
+    
+    noise_floor = min(continuous[i]['value'] for i in range(noise_start, noise_end + 1))
+    estimated_snr = peak_rssi - noise_floor
+    
+    packet['rssi'] = peak_rssi
+    packet['snr'] = estimated_snr
+    
+    return packet
+
 def pipeline_reader(process):
     """Read direwolf output and update statistics."""
     global stats
@@ -121,9 +191,17 @@ def pipeline_reader(process):
         # Print direwolf output to console
         print(line)
         
+        # Parse audio level for continuous monitoring
+        audio_level = parse_audio_level(line)
+        if audio_level is not None:
+            stats['last_audio_level'] = audio_level
+        
         packet = parse_direwolf_line(line)
         
         if packet:
+            # Enhance packet with peak RSSI/SNR from continuous monitoring
+            packet = enhance_packet_with_peak_rssi(packet)
+            
             stats['packets_received'] += 1
             stats['last_packets'].append(packet)
             
@@ -175,8 +253,70 @@ def pipeline_reader(process):
             socketio.emit('new_packet', packet)
             socketio.emit('stats_update', get_stats())
 
+# Signal power monitoring using tee to tap the pipeline
+def continuous_rssi_monitor():
+    """Background thread to compute RSSI every 100ms by tapping IQ stream."""
+    global stats, pipeline_running
+    
+    import numpy as np
+    import struct
+    
+    monitor_fifo = '/tmp/direwolf_iq_monitor.fifo'
+    
+    while True:
+        if pipeline_running:
+            try:
+                # Open FIFO for reading IQ samples
+                with open(monitor_fifo, 'rb') as fifo:
+                    print(f"RSSI monitor: reading from {monitor_fifo}")
+                    while pipeline_running:
+                        # Read 100ms of IQ data: 24kHz * 0.1s = 2400 samples * 8 bytes (CF32)
+                        chunk_size = 2400 * 8
+                        data = fifo.read(chunk_size)
+                        
+                        if len(data) < chunk_size:
+                            break
+                        
+                        # Parse CF32 (float32 I, float32 Q interleaved)
+                        num_floats = len(data) // 4
+                        samples = struct.unpack(f'<{num_floats}f', data)
+                        
+                        # Convert to complex
+                        iq = np.array(samples, dtype=np.float32)
+                        iq_complex = iq[0::2] + 1j * iq[1::2]
+                        
+                        # Compute power in dBFS
+                        power = np.mean(np.abs(iq_complex)**2)
+                        if power > 0:
+                            rssi_dbfs = 10 * np.log10(power)
+                        else:
+                            rssi_dbfs = -100
+                        
+                        rssi_dbfs = max(-100, min(0, rssi_dbfs))
+                        
+                        timestamp = datetime.now().isoformat()
+                        stats['continuous_rssi'].append({
+                            'time': timestamp,
+                            'value': rssi_dbfs
+                        })
+                        
+                        # Emit to clients
+                        socketio.emit('continuous_rssi', {
+                            'time': timestamp,
+                            'value': rssi_dbfs
+                        })
+                        
+            except FileNotFoundError:
+                print(f"RSSI monitor: waiting for FIFO {monitor_fifo}")
+                time.sleep(1)
+            except Exception as e:
+                print(f"RSSI monitor error: {e}")
+                time.sleep(1)
+        else:
+            time.sleep(0.5)
+
 def start_pipeline():
-    """Start the SDR→direwolf pipeline."""
+    """Start the SDR→direwolf pipeline with IQ tapping for continuous RSSI."""
     global pipeline_process, pipeline_running
     
     with pipeline_lock:
@@ -184,8 +324,19 @@ def start_pipeline():
             return {'success': False, 'error': 'Pipeline already running'}
         
         try:
-            # Build command
-            filter_arg = '4 0.005 HAMMING' if config['filter_quality'] == 'high' else '4'
+            # Create named pipe for monitoring
+            monitor_fifo = '/tmp/direwolf_iq_monitor.fifo'
+            import os
+            try:
+                if os.path.exists(monitor_fifo):
+                    os.remove(monitor_fifo)
+                os.mkfifo(monitor_fifo)
+                print(f"Created monitoring FIFO: {monitor_fifo}")
+            except Exception as e:
+                print(f"Warning: couldn't create FIFO: {e}")
+            
+            # Build command (decimate by 8 to lower bandwidth)
+            filter_arg = '8 0.005 HAMMING' if config['filter_quality'] == 'high' else '8'
             
             # Build sdrplay command parts
             sdr_cmd = (
@@ -199,10 +350,12 @@ def start_pipeline():
             if config['agc']:
                 sdr_cmd += " --agc"
             
+            # Add tee after decimation (at direwolf input) for accurate RSSI measurement
             full_cmd = (
                 f"{sdr_cmd} 2>/dev/null | "
                 f"csdr fir_decimate_cc {filter_arg} 2>/dev/null | "
-                f"./build/src/direwolf -M -t 0 -r 48000 -n 1 iq:48000 2>&1"
+                f"tee {monitor_fifo} | "
+                f"./build/src/direwolf -M -t 0 -r 24000 -n 1 iq:24000 2>&1"
             )
             
             print(f"Starting pipeline with command: {full_cmd}")
@@ -242,9 +395,21 @@ def stop_pipeline():
                 pipeline_process.terminate()
                 pipeline_process.wait(timeout=5)
             pipeline_running = False
+            
+            # Clean up monitoring FIFO
+            monitor_fifo = '/tmp/direwolf_iq_monitor.fifo'
+            import os
+            try:
+                if os.path.exists(monitor_fifo):
+                    os.remove(monitor_fifo)
+                    print(f"Removed monitoring FIFO: {monitor_fifo}")
+            except Exception as e:
+                print(f"Warning: couldn't remove FIFO: {e}")
+            
             return {'success': True}
         except Exception as e:
-            pipeline_process.kill()
+            if pipeline_process:
+                pipeline_process.kill()
             pipeline_running = False
             return {'success': False, 'error': str(e)}
 
@@ -353,6 +518,10 @@ if __name__ == '__main__':
     # Disable Flask request logging
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)
+    
+    # Start continuous RSSI monitoring thread
+    monitor_thread = threading.Thread(target=continuous_rssi_monitor, daemon=True)
+    monitor_thread.start()
     
     print("Starting Direwolf Web Interface...")
     print("Open http://localhost:5000 in your browser")

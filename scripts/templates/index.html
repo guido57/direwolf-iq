@@ -240,18 +240,10 @@
             </div>
         </div>
         
-        <div class="panels">
-            <div class="panel">
-                <h2>RSSI History (dBFS)</h2>
-                <div class="chart-container">
-                    <canvas id="rssiChart"></canvas>
-                </div>
-            </div>
-            <div class="panel">
-                <h2>SNR History (dB)</h2>
-                <div class="chart-container">
-                    <canvas id="snrChart"></canvas>
-                </div>
+        <div class="panel" style="margin-bottom: 20px;">
+            <h2>Continuous RSSI Monitor (100ms samples) with Decoded Packets</h2>
+            <div class="chart-container">
+                <canvas id="continuousRssiChart"></canvas>
             </div>
         </div>
         
@@ -279,22 +271,145 @@
     
     <script>
         const socket = io();
-        let rssiChart, snrChart;
-        const rssiMeta = [];
-        const snrMeta = [];
+        let continuousRssiChart;
         
-        // Initialize charts
-        const chartConfig = {
+        // Custom plugin to draw callsign labels below packet markers with collision avoidance
+        const packetLabelPlugin = {
+            id: 'packetLabels',
+            afterDatasetsDraw(chart) {
+                const ctx = chart.ctx;
+                const meta = chart.getDatasetMeta(1); // packet markers dataset
+                if (!meta || !meta.data) return;
+                
+                const dataset = chart.data.datasets[1];
+                const infoArr = dataset._packetInfo || [];
+                
+                ctx.save();
+                ctx.font = '10px monospace';
+                ctx.fillStyle = '#FFEB3B';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'top';
+                
+                // Collect all label positions with their info
+                const labels = [];
+                meta.data.forEach((point, index) => {
+                    if (!point || isNaN(dataset.data[index])) return;
+                    const info = infoArr[index];
+                    if (!info) return;
+                    
+                    const callsign = info.callsign || '';
+                    const via = info.via || '';
+                    
+                    // Measure actual text width
+                    const callsignWidth = ctx.measureText(callsign).width;
+                    const viaWidth = ctx.measureText(via).width;
+                    const labelWidth = Math.max(callsignWidth, viaWidth);
+                    
+                    labels.push({
+                        x: point.x,
+                        yOffset: 0, // Will be adjusted for collisions
+                        callsign,
+                        via,
+                        width: labelWidth,
+                        height: 24 // Two lines of text
+                    });
+                });
+                
+                // Sort labels by x position (left to right)
+                labels.sort((a, b) => a.x - b.x);
+                
+                // Track occupied regions at each vertical level
+                const levels = [[]]; // levels[0] = array of {xMin, xMax} for level 0
+                const minSpacing = 8; // Minimum horizontal gap between labels
+                
+                // Assign each label to the lowest available level
+                labels.forEach(label => {
+                    const labelLeft = label.x - label.width / 2 - minSpacing / 2;
+                    const labelRight = label.x + label.width / 2 + minSpacing / 2;
+                    
+                    // Find the lowest level where this label fits
+                    let assignedLevel = -1;
+                    for (let level = 0; level < levels.length; level++) {
+                        let fits = true;
+                        for (const occupied of levels[level]) {
+                            if (labelLeft < occupied.xMax && labelRight > occupied.xMin) {
+                                fits = false;
+                                break;
+                            }
+                        }
+                        if (fits) {
+                            assignedLevel = level;
+                            break;
+                        }
+                    }
+                    
+                    // If no level works, create a new one
+                    if (assignedLevel === -1) {
+                        assignedLevel = levels.length;
+                        levels.push([]);
+                    }
+                    
+                    // Mark this region as occupied
+                    levels[assignedLevel].push({ xMin: labelLeft, xMax: labelRight });
+                    label.yOffset = assignedLevel * 24;
+                });
+                
+                // Draw all labels with their adjusted positions
+                const yBottom = chart.chartArea.bottom;
+                labels.forEach(label => {
+                    ctx.fillText(label.callsign, label.x, yBottom + 2 + label.yOffset);
+                    ctx.fillText(label.via, label.x, yBottom + 13 + label.yOffset);
+                });
+                
+                ctx.restore();
+            }
+        };
+        
+        // Continuous RSSI chart (100ms samples, show time in tooltip) + packet markers
+        continuousRssiChart = new Chart(document.getElementById('continuousRssiChart'), {
             type: 'line',
+            data: {
+                labels: [],
+                datasets: [{
+                    label: 'RSSI (dBFS)',
+                    data: [],
+                    // parallel array to hold timestamps for tooltips
+                    _timestamps: [],
+                    borderColor: '#00BCD4',
+                    backgroundColor: 'rgba(0, 188, 212, 0.1)',
+                    borderWidth: 1,
+                    pointRadius: 0,  // No points for smooth line
+                    fill: true
+                }, {
+                    label: 'Packets',
+                    data: [],                // aligned with labels; NaN except at packet points
+                    _packetInfo: [],         // per-index meta: {rssi, callsign, via, timeStr}
+                    borderColor: '#FFEB3B',
+                    backgroundColor: '#FFEB3B',
+                    showLine: false,
+                    pointRadius: 3,
+                    pointHoverRadius: 4
+                }]
+            },
             options: {
                 responsive: true,
                 maintainAspectRatio: false,
                 animation: false,
+                layout: {
+                    padding: {
+                        bottom: 80  // Space for callsign/via labels (allow for stacking)
+                    }
+                },
                 scales: {
                     x: { display: false },
                     y: { 
                         ticks: { color: '#999' },
-                        grid: { color: '#333' }
+                        grid: { color: '#333' },
+                        title: {
+                            display: true,
+                            text: 'RSSI (dBFS)',
+                            color: '#999'
+                        }
                     }
                 },
                 plugins: {
@@ -302,49 +417,30 @@
                     tooltip: {
                         callbacks: {
                             label: (ctx) => {
-                                const val = ctx.parsed.y;
-                                return `${ctx.dataset.label}: ${val !== undefined ? val.toFixed(1) : '-'}`;
-                            },
-                            afterBody: (items) => {
-                                if (!items || !items.length) return '';
-                                const idx = items[0].dataIndex;
-                                const metaArr = items[0].dataset.label === 'RSSI' ? rssiMeta : snrMeta;
-                                const meta = metaArr[idx];
-                                if (!meta) return '';
-                                return [`Callsign: ${meta.callsign}`, `Via: ${meta.via}`, `Time: ${meta.time}`];
+                                if (ctx.dataset.label === 'Packets') {
+                                    const infoArr = ctx.dataset._packetInfo || [];
+                                    const info = infoArr[ctx.dataIndex];
+                                    if (!info) return '';
+                                    const rssiStr = `RSSI: ${Number(info.rssi).toFixed(1)} dBFS`;
+                                    return [
+                                        rssiStr,
+                                        `Callsign: ${info.callsign || '-'}`,
+                                        `Via: ${info.via || '-'}`,
+                                        `Time: ${info.timeStr || '-'}`
+                                    ];
+                                } else {
+                                    const tsArr = ctx.dataset._timestamps || [];
+                                    const ts = tsArr[ctx.dataIndex];
+                                    const tStr = ts ? new Date(ts).toLocaleTimeString() : '';
+                                    const rssiStr = `RSSI: ${ctx.parsed.y.toFixed(1)} dBFS`;
+                                    return tStr ? `${rssiStr}  •  ${tStr}` : rssiStr;
+                                }
                             }
                         }
                     }
                 }
-            }
-        };
-        
-        rssiChart = new Chart(document.getElementById('rssiChart'), {
-            ...chartConfig,
-            data: {
-                labels: [],
-                datasets: [{
-                    label: 'RSSI',
-                    data: [],
-                    borderColor: '#2196F3',
-                    backgroundColor: 'rgba(33, 150, 243, 0.1)',
-                    fill: true
-                }]
-            }
-        });
-        
-        snrChart = new Chart(document.getElementById('snrChart'), {
-            ...chartConfig,
-            data: {
-                labels: [],
-                datasets: [{
-                    label: 'SNR',
-                    data: [],
-                    borderColor: '#FF9800',
-                    backgroundColor: 'rgba(255, 152, 0, 0.1)',
-                    fill: true
-                }]
-            }
+            },
+            plugins: [packetLabelPlugin]
         });
         
         // Helpers
@@ -365,33 +461,89 @@
             return 'Direct';
         }
 
-        function pushChartPoint(chart, metaArr, value, packet) {
-            chart.data.labels.push('');
-            chart.data.datasets[0].data.push(value);
-            const via = deriveViaFromPacket(packet);
-            metaArr.push({
-                callsign: packet.sender || '-',
-                via,
-                time: packet.timestamp ? new Date(packet.timestamp).toLocaleTimeString() : '-'
-            });
-            if (chart.data.labels.length > 50) {
-                chart.data.labels.shift();
-                chart.data.datasets[0].data.shift();
-                metaArr.shift();
-            }
-            chart.update('none');
-        }
-
         // Socket events
         socket.on('new_packet', (packet) => {
             addPacketToLog(packet);
             if (packet.rssi !== undefined && packet.rssi !== null) {
-                pushChartPoint(rssiChart, rssiMeta, packet.rssi, packet);
-            }
-            if (packet.snr !== undefined && packet.snr !== null) {
-                pushChartPoint(snrChart, snrMeta, packet.snr, packet);
+                // Add marker on the continuous RSSI chart at peak position
+                addPacketMarkerToRssiChart(packet);
             }
         });
+        
+        socket.on('continuous_rssi', (data) => {
+            // Add continuous RSSI sample (100ms interval)
+            const ds = continuousRssiChart.data.datasets[0];     // line dataset
+            const pkt = continuousRssiChart.data.datasets[1];     // packet markers
+            continuousRssiChart.data.labels.push('');
+            ds.data.push(data.value);
+            ds._timestamps.push(data.time);
+            // keep overlay arrays aligned
+            pkt.data.push(NaN);
+            pkt._packetInfo.push(null);
+            
+            // Keep last 600 samples (60 seconds at 100ms)
+            if (continuousRssiChart.data.labels.length > 600) {
+                continuousRssiChart.data.labels.shift();
+                ds.data.shift();
+                ds._timestamps.shift();
+                pkt.data.shift();
+                pkt._packetInfo.shift();
+            }
+            continuousRssiChart.update('none');
+        });
+
+        // Map packet events to peak RSSI in window around packet timestamp
+        function addPacketMarkerToRssiChart(packet) {
+            const ds = continuousRssiChart.data.datasets[0];
+            const pkt = continuousRssiChart.data.datasets[1];
+            if (!ds._timestamps || ds._timestamps.length === 0) return;
+            if (packet.rssi === undefined || packet.rssi === null) return;
+            
+            const tsTarget = Date.parse(packet.timestamp);
+            if (isNaN(tsTarget)) return;
+            
+            // Find the closest timestamp index
+            let centerIdx = -1;
+            let bestDelta = Infinity;
+            for (let i = 0; i < ds._timestamps.length; i++) {
+                const t = Date.parse(ds._timestamps[i]);
+                if (isNaN(t)) continue;
+                const d = Math.abs(t - tsTarget);
+                if (d < bestDelta) {
+                    bestDelta = d;
+                    centerIdx = i;
+                }
+            }
+            // Require a reasonably close match (<= 500 ms)
+            if (centerIdx === -1 || bestDelta > 500) return;
+            
+            // Search for peak RSSI in a window: ±500ms (~±5 samples at 100ms)
+            const windowSize = 5;
+            const startIdx = Math.max(0, centerIdx - windowSize);
+            const endIdx = Math.min(ds.data.length - 1, centerIdx + windowSize);
+            
+            let peakIdx = centerIdx;
+            let peakValue = ds.data[centerIdx];
+            for (let i = startIdx; i <= endIdx; i++) {
+                const val = ds.data[i];
+                if (!isNaN(val) && val > peakValue) {
+                    peakValue = val;
+                    peakIdx = i;
+                }
+            }
+            
+            // Place marker at peak position with measured RSSI value from packet
+            pkt.data[peakIdx] = peakValue;  // Use peak value for Y position
+            const via = deriveViaFromPacket(packet);
+            pkt._packetInfo[peakIdx] = {
+                rssi: Number(packet.rssi),  // Keep direwolf's reported RSSI in tooltip
+                callsign: packet.sender || '-',
+                via,
+                timeStr: packet.timestamp ? new Date(packet.timestamp).toLocaleTimeString() : '-'
+            };
+            
+            continuousRssiChart.update('none');
+        }
         
         socket.on('stats_update', (stats) => {
             document.getElementById('packetsReceived').textContent = stats.packets_received;
