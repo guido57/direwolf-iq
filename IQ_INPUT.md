@@ -248,5 +248,5 @@ Possible improvements:
 ## Credits
 
 - FM demodulation implementation: 2025
-- Based on standard quadrature demodulation techniques
+tha- Based on standard quadrature demodulation techniques
 - Inspired by existing SDR FM demodulators (gqrx, rtl_fm, etc.)
