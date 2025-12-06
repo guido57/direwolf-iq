@@ -32,9 +32,11 @@ pipeline_lock = threading.Lock()
 # Now uses SoapySDR config files for multi-device support
 config = {
     'device': 'rtlsdr',  # Device type: 'rtlsdr', 'sdrplay', 'airspy', 'hackrf'
-    'frequency': 144.825,
+    'frequency': 144.8,  # 2m APRS frequency
     'sample_rate': 1024000,  # RTL-SDR: 1.024M, SDRplay: 192k
-    'gain': 40.0,  # Device-specific (RTL-SDR TUNER: 0-50 dB, SDRplay IFGR: 20-59 dB)
+    'gain': 40.0,  # Generic gain (for backward compatibility)
+    'ifgr': 40,      # Gain for RTL-SDR (0-50) or SDRplay IFGR (20-59)
+    'rfgr': 0,       # SDRplay RF Gain Reduction (0-3)
     'agc': False,
     'filter_quality': 'high',  # 'standard' or 'high'
     'decimation': 64  # Calculated based on sample rate
@@ -45,7 +47,7 @@ stats = {
     'packets_received': 0,
     'stations_heard': set(),
     'direct_rf_senders': set(),
-    'last_packets': deque(maxlen=50),
+    'last_packets': deque(maxlen=500),  # Store up to 500 recent packets
     'rssi_history': deque(maxlen=100),
     'snr_history': deque(maxlen=100),
     'continuous_rssi': deque(maxlen=600),  # 60 seconds at 100ms (10 samples/sec)
@@ -142,12 +144,18 @@ AGC {str(config['agc']).lower()}
     
     # Add device-specific gain parameter
     if config['device'] == 'rtlsdr':
-        config_content += f"GAIN TUNER {config['gain']}\n"
+        # RTL-SDR uses discrete TUNER gains; snap to closest supported value
+        supported = [0.0, 0.9, 1.4, 2.7, 3.7, 7.7, 8.7, 12.5, 14.4, 15.7,
+                     16.6, 19.7, 20.7, 22.9, 25.4, 28.0, 29.7, 32.8, 33.8,
+                     36.4, 37.2, 38.6, 40.2, 42.1, 43.4, 43.9, 44.5, 48.0, 49.6]
+        requested = max(0.0, min(50.0, float(config['ifgr'])))
+        gain = min(supported, key=lambda g: abs(g - requested))
+        config_content += f"GAIN TUNER {gain}\n"
     elif config['device'] == 'sdrplay':
         # SDRplay uses IFGR (IF Gain Reduction) and RFGR (RF Gain Reduction)
-        # For compatibility, map gain to IFGR
-        ifgr = max(20, min(59, int(config['gain'])))
-        config_content += f"GAIN IFGR {ifgr}\nGAIN RFGR 0\n"
+        ifgr = max(20, min(59, int(config['ifgr'])))
+        rfgr = max(0, min(3, int(config['rfgr'])))
+        config_content += f"GAIN IFGR {ifgr}\nGAIN RFGR {rfgr}\n"
     elif config['device'] == 'airspy':
         config_content += f"GAIN LINEARITY {config['gain']}\n"
     elif config['device'] == 'hackrf':
@@ -295,7 +303,7 @@ def pipeline_reader(process):
 # Signal power monitoring using tee to tap the pipeline
 def continuous_rssi_monitor():
     """Background thread to compute RSSI every 100ms by tapping IQ stream."""
-    global stats, pipeline_running
+    global stats, pipeline_running, config
     
     import numpy as np
     import struct
@@ -305,12 +313,17 @@ def continuous_rssi_monitor():
     while True:
         if pipeline_running:
             try:
+                # Calculate output rate after decimation
+                decimation = max(1, int(config['sample_rate'] / 24000))
+                output_rate = config['sample_rate'] // decimation
+                
                 # Open FIFO for reading IQ samples
                 with open(monitor_fifo, 'rb') as fifo:
-                    print(f"RSSI monitor: reading from {monitor_fifo}")
+                    print(f"RSSI monitor: reading from {monitor_fifo} at {output_rate} Hz")
                     while pipeline_running:
-                        # Read 100ms of IQ data: 24kHz * 0.1s = 2400 samples * 8 bytes (CF32)
-                        chunk_size = 2400 * 8
+                        # Read 100ms of IQ data: output_rate * 0.1s samples * 8 bytes (CF32)
+                        samples_per_100ms = int(output_rate * 0.1)
+                        chunk_size = samples_per_100ms * 8
                         data = fifo.read(chunk_size)
                         
                         if len(data) < chunk_size:
@@ -466,6 +479,64 @@ def get_stats():
 def index():
     return render_template('index.html')
 
+def load_device_preset(device_name):
+    """Load preset configuration from scripts/{device}.conf file"""
+    preset_files = {
+        'rtlsdr': 'scripts/rtlsdr.conf',
+        'sdrplay': 'scripts/rsp1.conf',
+    }
+    
+    config_file = preset_files.get(device_name)
+    if not config_file or not os.path.exists(config_file):
+        return None
+    
+    try:
+        preset = {
+            'device': device_name,
+            'frequency': 144.8,
+            'sample_rate': 1024000,
+            'gain': 40.0,
+            'ifgr': 40,
+            'rfgr': 0,
+            'agc': False,
+            'filter_quality': 'high',
+        }
+        
+        with open(config_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                
+                parts = line.split(None, 1)
+                if len(parts) < 2:
+                    continue
+                
+                key, value = parts
+                
+                if key == 'FREQUENCY':
+                    preset['frequency'] = float(value)
+                elif key == 'SAMPLE_RATE':
+                    preset['sample_rate'] = int(value)
+                elif key == 'AGC':
+                    preset['agc'] = value.lower() in ('true', 'yes', '1', 'on')
+                elif key == 'GAIN':
+                    gain_parts = value.split(None, 1)
+                    if len(gain_parts) == 2:
+                        gain_name, gain_value = gain_parts
+                        if gain_name.upper() == 'IFGR':
+                            preset['ifgr'] = int(float(gain_value))
+                        elif gain_name.upper() == 'RFGR':
+                            preset['rfgr'] = int(float(gain_value))
+                        elif gain_name.upper() == 'TUNER':
+                            preset['ifgr'] = int(float(gain_value))
+        
+        print(f"Loaded device preset for {device_name} from {config_file}: {preset}")
+        return preset
+    except Exception as e:
+        print(f"Warning: Could not load preset from {config_file}: {e}")
+        return None
+
 @app.route('/api/config', methods=['GET'])
 def get_config():
     return jsonify(config)
@@ -486,6 +557,10 @@ def update_config():
         config['sample_rate'] = int(data['sample_rate'])
     if 'gain' in data:
         config['gain'] = float(data['gain'])
+    if 'ifgr' in data:
+        config['ifgr'] = int(data['ifgr'])
+    if 'rfgr' in data:
+        config['rfgr'] = int(data['rfgr'])
     if 'agc' in data:
         config['agc'] = bool(data['agc'])
     if 'filter_quality' in data:
@@ -503,6 +578,15 @@ def update_config():
         start_pipeline()
     
     return jsonify({'success': True, 'config': config})
+
+@app.route('/api/preset/<device>', methods=['GET'])
+def load_preset(device):
+    """Load preset configuration for a device from its .conf file"""
+    preset = load_device_preset(device)
+    if preset:
+        return jsonify({'success': True, 'config': preset})
+    else:
+        return jsonify({'success': False, 'error': f'No preset found for {device}'}), 404
 
 @app.route('/api/pipeline/start', methods=['POST'])
 def api_start_pipeline():
@@ -558,9 +642,14 @@ def api_get_metrics():
 
 if __name__ == '__main__':
     import logging
-    # Disable Flask request logging
+    # Disable Flask request logging completely
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)
+    log.disabled = True
+    
+    # Disable socketio logging
+    logging.getLogger('socketio').setLevel(logging.ERROR)
+    logging.getLogger('engineio').setLevel(logging.ERROR)
     
     # Start continuous RSSI monitoring thread
     monitor_thread = threading.Thread(target=continuous_rssi_monitor, daemon=True)
@@ -569,4 +658,4 @@ if __name__ == '__main__':
     print("Starting Direwolf Web Interface...")
     print("Open http://localhost:5000 in your browser")
     print("=" * 80)
-    socketio.run(app, host='0.0.0.0', port=5000, debug=False, log_output=False)
+    socketio.run(app, host='0.0.0.0', port=5000, debug=False, log_output=False, allow_unsafe_werkzeug=True)

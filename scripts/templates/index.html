@@ -192,15 +192,29 @@
         <div class="controls">
             <div class="control-row">
                 <div class="control-group">
+                    <label>Device</label>
+                    <select id="device">
+                        <option value="rtlsdr">RTL-SDR</option>
+                        <option value="sdrplay">SDRplay / RSP1</option>
+                        <option value="airspy">Airspy</option>
+                        <option value="hackrf">HackRF</option>
+                    </select>
+                </div>
+                <div class="control-group">
                     <label>Frequency (MHz)</label>
                     <input type="number" id="frequency" step="0.001" value="144.8">
                 </div>
                 <div class="control-group">
-                    <label>IF Gain Reduction (20-59)</label>
-                    <input type="number" id="ifgr" min="20" max="59" value="23">
+                    <label>Sample Rate (Hz)</label>
+                    <input type="number" id="sample_rate" step="1000" value="1024000">
                 </div>
                 <div class="control-group">
-                    <label>RF Gain Reduction (0-3)</label>
+                    <label>Gain (RTL-SDR: 0-50 higher=more, SDRplay IFGR: 20-59 lower=more)</label>
+                    <input type="number" id="ifgr" min="0" max="59" value="40">
+                    <small id="gainInfo" style="color:#999;font-size:11px;margin-top:2px;display:block;"></small>
+                </div>
+                <div class="control-group">
+                    <label>RFGR (SDRplay only: 0-3, lower=more gain)</label>
                     <input type="number" id="rfgr" min="0" max="3" value="0">
                 </div>
                 <div class="control-group">
@@ -572,7 +586,7 @@
                 <br><span style="color:#4CAF50">${fullPacket}</span>
             `;
             log.insertBefore(item, log.firstChild);
-            if (log.children.length > 50) log.removeChild(log.lastChild);
+            if (log.children.length > 500) log.removeChild(log.lastChild);
         }
         
         function updatePipelineStatus(running) {
@@ -591,36 +605,53 @@
             }
         }
         
-        async function startPipeline() {
-            const response = await fetch('/api/pipeline/start', { method: 'POST' });
-            const data = await response.json();
-            if (!data.success) alert('Failed to start: ' + data.error);
-        }
-        
-        async function stopPipeline() {
-            const response = await fetch('/api/pipeline/stop', { method: 'POST' });
-            const data = await response.json();
-            if (!data.success) alert('Failed to stop: ' + data.error);
-        }
-        
-        async function applySettings() {
-            const config = {
+        function readConfigFromForm() {
+            return {
+                device: document.getElementById('device').value,
                 frequency: parseFloat(document.getElementById('frequency').value),
+                sample_rate: parseInt(document.getElementById('sample_rate').value),
                 ifgr: parseInt(document.getElementById('ifgr').value),
                 rfgr: parseInt(document.getElementById('rfgr').value),
                 agc: document.getElementById('agc').value === 'true',
                 filter_quality: document.getElementById('filter').value
             };
-            
+        }
+
+        async function pushConfig(config) {
             const response = await fetch('/api/config', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(config)
             });
-            
+            return response.json();
+        }
+
+        async function startPipeline() {
+            // Always push current UI settings before starting
+            const cfg = readConfigFromForm();
+            const cfgResp = await pushConfig(cfg);
+            if (!cfgResp.success) {
+                alert('Failed to apply settings: ' + cfgResp.error);
+                return;
+            }
+            const response = await fetch('/api/pipeline/start', { method: 'POST' });
             const data = await response.json();
+            if (!data.success) alert('Failed to start: ' + data.error);
+        }
+
+        async function stopPipeline() {
+            const response = await fetch('/api/pipeline/stop', { method: 'POST' });
+            const data = await response.json();
+            if (!data.success) alert('Failed to stop: ' + data.error);
+        }
+
+        async function applySettings() {
+            const config = readConfigFromForm();
+            const data = await pushConfig(config);
             if (data.success) {
                 alert('Settings applied! Pipeline will restart if running.');
+            } else if (data.error) {
+                alert('Failed to apply settings: ' + data.error);
             }
         }
         
@@ -649,6 +680,48 @@
             }).join('');
         }
         
+        async function loadPackets() {
+            try {
+                const response = await fetch('/api/packets');
+                const packets = await response.json();
+                const log = document.getElementById('packetLog');
+                
+                if (!log) {
+                    console.error('Packet log element not found');
+                    return;
+                }
+                
+                // Clear existing packets
+                log.innerHTML = '';
+                
+                // Load packets in reverse order (newest first)
+                // API returns oldest first in the deque, so reverse to show newest at top
+                for (let i = packets.length - 1; i >= 0; i--) {
+                    const packet = packets[i];
+                    const time = new Date(packet.timestamp).toLocaleTimeString();
+                    const rssi = packet.rssi ? `RSSI=${packet.rssi.toFixed(1)}` : '';
+                    const snr = packet.snr ? `SNR=${packet.snr.toFixed(1)}` : '';
+                    
+                    // Build full APRS packet string
+                    const fullPacket = `${packet.sender}>${packet.path}:${packet.message}`;
+                    
+                    const item = document.createElement('div');
+                    item.className = 'packet-item';
+                    item.innerHTML = `
+                        <span class="packet-time">[${time}]</span>
+                        ${packet.rssi ? `<span class="packet-rssi">${rssi}</span>` : ''}
+                        ${packet.snr ? `<span class="packet-snr">${snr}</span>` : ''}
+                        <br><span style="color:#4CAF50">${fullPacket}</span>
+                    `;
+                    log.appendChild(item);
+                }
+                
+                console.log(`Loaded ${packets.length} historical packets`);
+            } catch (e) {
+                console.error('Failed to load packets', e);
+            }
+        }
+        
         // Periodic updates
         setInterval(loadStations, 5000);
         setInterval(async () => {
@@ -658,7 +731,84 @@
         }, 2000);
         
         // Initial load
+        function updateGainInfo() {
+            const device = document.getElementById('device').value;
+            const ifgr = parseInt(document.getElementById('ifgr').value);
+            const rfgr = parseInt(document.getElementById('rfgr').value);
+            const gainInfoEl = document.getElementById('gainInfo');
+            
+            if (device === 'sdrplay') {
+                // SDRplay: IFGR 20-59, actual gain ≈ (59 - IFGR) dB
+                const approxGain = 59 - ifgr;
+                const rfgrNote = rfgr === 0 ? ' (max RF gain)' : ` (RF -${rfgr * 3}dB)`;
+                gainInfoEl.textContent = `≈ ${approxGain} dB total${rfgrNote}`;
+                gainInfoEl.style.display = 'block';
+            } else if (device === 'rtlsdr') {
+                gainInfoEl.textContent = `TUNER gain (will snap to nearest supported value)`;
+                gainInfoEl.style.display = 'block';
+            } else {
+                gainInfoEl.style.display = 'none';
+            }
+        }
+
+        async function loadPreset(device) {
+            try {
+                const response = await fetch(`/api/preset/${device}`);
+                if (!response.ok) {
+                    console.log(`No preset found for ${device}`);
+                    return false;
+                }
+                const data = await response.json();
+                if (data.success && data.config) {
+                    const cfg = data.config;
+                    document.getElementById('frequency').value = cfg.frequency || 144.8;
+                    document.getElementById('sample_rate').value = cfg.sample_rate || 1024000;
+                    document.getElementById('ifgr').value = cfg.ifgr || 40;
+                    document.getElementById('rfgr').value = cfg.rfgr || 0;
+                    document.getElementById('agc').value = String(cfg.agc || false);
+                    document.getElementById('filter').value = cfg.filter_quality || 'high';
+                    updateGainInfo();
+                    console.log(`Loaded preset for ${device}:`, cfg);
+                    return true;
+                }
+            } catch (e) {
+                console.error(`Failed to load preset for ${device}`, e);
+            }
+            return false;
+        }
+
+        async function onDeviceChange() {
+            const device = document.getElementById('device').value;
+            // Try to load preset; if none exists, just update gain info
+            await loadPreset(device);
+            updateGainInfo();
+        }
+
+        async function loadConfig() {
+            try {
+                const response = await fetch('/api/config');
+                const cfg = await response.json();
+                document.getElementById('device').value = cfg.device || 'rtlsdr';
+                document.getElementById('frequency').value = cfg.frequency || 144.8;
+                document.getElementById('sample_rate').value = cfg.sample_rate || 1024000;
+                document.getElementById('ifgr').value = cfg.ifgr || 40;
+                document.getElementById('rfgr').value = cfg.rfgr || 0;
+                document.getElementById('agc').value = String(cfg.agc || false);
+                document.getElementById('filter').value = cfg.filter_quality || 'high';
+                updateGainInfo();
+            } catch (e) {
+                console.error('Failed to load config', e);
+            }
+        }
+
+        // Update gain info when device or gain changes
+        document.getElementById('device').addEventListener('change', onDeviceChange);
+        document.getElementById('ifgr').addEventListener('input', updateGainInfo);
+        document.getElementById('rfgr').addEventListener('input', updateGainInfo);
+
+        loadConfig();
         loadStations();
+        loadPackets();
     </script>
 </body>
 </html>

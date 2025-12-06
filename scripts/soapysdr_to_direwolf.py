@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
 """
-Stream IQ samples from any SoapySDR-supported device to direwolf via stdout.
-Supports: SDRplay RSP1/RSP2, RTL-SDR, Airspy, HackRF, and other SoapySDR devices.
+Unified SoapySDR to Direwolf launcher with optional web interface.
 
-Requires: python3-soapysdr
-Install: sudo apt install python3-soapysdr
+This script provides two modes:
+1. Direct streaming mode: Streams IQ samples from any SoapySDR device to stdout
+2. Unified launcher mode: Runs a complete pipeline with optional web monitoring
 
-Usage: 
-  python3 soapysdr_to_direwolf.py [options]
-  python3 soapysdr_to_direwolf.py --config soapysdr.conf
-  python3 soapysdr_to_direwolf.py --device rtlsdr --freq 144.8 --gain 40
+Direct Streaming Mode (pipes to other tools):
+  python3 soapysdr_to_direwolf.py --config rtlsdr.conf | csdr fir_decimate_cc 8 | direwolf
 
-Options:
-  --config FILE      Configuration file (default: soapysdr.conf)
-  --device TYPE      Device type (sdrplay, rtlsdr, airspy, hackrf, auto)
-  --freq MHz         Frequency in MHz (default: 144.8)
-  --gain VALUE       Gain in dB (device-specific, see config file)
-  --agc              Enable automatic gain control
-  --list-devices     List all available SoapySDR devices and exit
+Unified Launcher Mode (command-line):
+  python3 soapysdr_to_direwolf.py --config rtlsdr.conf --launcher
+  python3 soapysdr_to_direwolf.py --config rsp1.conf --launcher --direwolf-config ~/direwolf.conf
 
-Device-specific gain settings (when not using config file):
+Unified Launcher Mode (with web interface):
+  python3 soapysdr_to_direwolf.py --config rsp1.conf --launcher --web
+  # Then open http://localhost:5000 in your browser
+
+Device-specific gain settings (direct mode only):
   SDRplay:  --ifgr 23 --rfgr 0
   RTL-SDR:  --gain 40.0
   Airspy:   --lna 10 --mixer 10 --vga 10
@@ -29,8 +27,23 @@ Device-specific gain settings (when not using config file):
 import sys
 import argparse
 import numpy as np
+import os
+import signal
+import subprocess
+import threading
+import time
+from pathlib import Path
+
 import SoapySDR
 from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CF32
+
+# Add scripts directory to path for imports
+script_dir = Path(__file__).parent.absolute()
+sys.path.insert(0, str(script_dir))
+
+# ============================================================================
+# SECTION 1: Direct Streaming Functions
+# ============================================================================
 
 def log(msg):
     """Print to stderr so it doesn't interfere with IQ data on stdout"""
@@ -59,12 +72,10 @@ def detect_device():
         sys.exit(1)
     
     device_info = results[0]
-    # Convert SoapySDR kwargs object to dict
     device_dict = dict(device_info)
     driver = device_dict.get('driver', 'unknown')
     log(f"Auto-detected device: {driver}")
     
-    # Log device details
     for key, value in device_dict.items():
         if key != 'driver':
             log(f"  {key}: {value}")
@@ -87,25 +98,21 @@ def load_config(config_file):
         with open(config_file, 'r') as f:
             for line in f:
                 line = line.strip()
-                # Skip comments and empty lines
                 if not line or line.startswith('#'):
                     continue
                 
-                # Parse KEY VALUE format
                 parts = line.split(None, 1)
                 if len(parts) < 2:
                     continue
                 
                 key, value = parts[0].upper(), parts[1]
                 
-                # Strip inline comments from value
                 if '#' in value:
                     value = value.split('#')[0].strip()
                 else:
                     value = value.strip()
                 
                 if key == 'DEVICE':
-                    # Parse device string (e.g., "driver=sdrplay" or "driver=sdrplay serial=123")
                     device_dict = {}
                     for item in value.split():
                         if '=' in item:
@@ -121,7 +128,6 @@ def load_config(config_file):
                 elif key == 'ANTENNA':
                     config['antenna'] = value.strip('"')
                 elif key == 'GAIN':
-                    # GAIN NAME VALUE format
                     gain_parts = value.split(None, 1)
                     if len(gain_parts) == 2:
                         gain_name, gain_value = gain_parts
@@ -130,11 +136,9 @@ def load_config(config_file):
                         except ValueError:
                             config['gains'][gain_name.upper()] = int(gain_value)
                 elif key == 'SETTING':
-                    # SETTING NAME VALUE format
                     setting_parts = value.split(None, 1)
                     if len(setting_parts) == 2:
                         setting_name, setting_value = setting_parts
-                        # Parse boolean values
                         if setting_value.lower() in ('true', 'false'):
                             config['settings'][setting_name] = setting_value.lower() == 'true'
                         else:
@@ -156,6 +160,13 @@ def setup_sdrplay_gains(sdr, config, use_agc):
             sdr.setGainMode(SOAPY_SDR_RX, 0, True)
         return
     
+    # Explicitly disable AGC before setting manual gains
+    try:
+        if sdr.hasGainMode(SOAPY_SDR_RX, 0):
+            sdr.setGainMode(SOAPY_SDR_RX, 0, False)
+    except Exception as e:
+        log(f"Warning: Could not disable SDRplay AGC: {e}")
+    
     gains = config.get('gains', {})
     ifgr = gains.get('IFGR', 23)
     rfgr = gains.get('RFGR', 0)
@@ -166,8 +177,7 @@ def setup_sdrplay_gains(sdr, config, use_agc):
         log(f"SDRplay gains: IFGR={ifgr}, RFGR={rfgr}")
     except Exception as e:
         log(f"Warning: Could not set IFGR/RFGR: {e}")
-        # Fallback to combined gain
-        combined_gain = 59 - ifgr  # Convert IFGR to positive gain
+        combined_gain = 59 - ifgr
         sdr.setGain(SOAPY_SDR_RX, 0, combined_gain)
         log(f"Using combined gain: {combined_gain} dB")
 
@@ -181,11 +191,22 @@ def setup_rtlsdr_gains(sdr, config, use_agc):
             pass
         return
     
+    try:
+        sdr.setGainMode(SOAPY_SDR_RX, 0, False)
+        log("RTL-SDR AGC: disabled (manual gain)")
+    except Exception as e:
+        log(f"Warning: Could not disable RTL-SDR AGC: {e}")
+
     gains = config.get('gains', {})
-    gain = gains.get('TUNER', 40.0)
+    supported = [0.0, 0.9, 1.4, 2.7, 3.7, 7.7, 8.7, 12.5, 14.4, 15.7,
+                 16.6, 19.7, 20.7, 22.9, 25.4, 28.0, 29.7, 32.8, 33.8,
+                 36.4, 37.2, 38.6, 40.2, 42.1, 43.4, 43.9, 44.5, 48.0, 49.6]
+    requested = float(gains.get('TUNER', 40.0))
+    requested = max(0.0, min(49.6, requested))
+    gain = min(supported, key=lambda g: abs(g - requested))
     try:
         sdr.setGain(SOAPY_SDR_RX, 0, gain)
-        log(f"RTL-SDR gain: {gain} dB")
+        log(f"RTL-SDR gain (TUNER snapped): {gain} dB (requested {requested})")
     except Exception as e:
         log(f"Warning: Could not set gain: {e}")
 
@@ -239,7 +260,6 @@ def setup_device_gains(sdr, device_type, config, use_agc):
     elif device_type == 'hackrf':
         setup_hackrf_gains(sdr, config, use_agc)
     else:
-        # Generic gain setting for unknown devices
         if use_agc:
             try:
                 sdr.setGainMode(SOAPY_SDR_RX, 0, True)
@@ -254,97 +274,16 @@ def setup_device_gains(sdr, device_type, config, use_agc):
             except Exception as e:
                 log(f"Warning: Could not set gain: {e}")
 
-def main():
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(
-        description='Stream IQ from any SoapySDR device to direwolf',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__)
-    
-    parser.add_argument('--config', type=str, default='soapysdr.conf',
-                        help='Configuration file (default: soapysdr.conf)')
-    parser.add_argument('--device', type=str,
-                        help='Device type: sdrplay, rtlsdr, airspy, hackrf, or auto')
-    parser.add_argument('--freq', type=float,
-                        help='Frequency in MHz (default: from config or 144.8)')
-    parser.add_argument('--gain', type=float,
-                        help='Gain in dB (device-specific)')
-    parser.add_argument('--agc', action='store_true',
-                        help='Enable automatic gain control')
-    parser.add_argument('--list-devices', action='store_true',
-                        help='List all available devices and exit')
-    
-    # SDRplay-specific
-    parser.add_argument('--ifgr', type=int,
-                        help='SDRplay IF Gain Reduction (20-59)')
-    parser.add_argument('--rfgr', type=int,
-                        help='SDRplay RF Gain Reduction (0-3)')
-    
-    # Airspy-specific
-    parser.add_argument('--lna', type=int,
-                        help='Airspy LNA gain (0-15)')
-    parser.add_argument('--mixer', type=int,
-                        help='Airspy Mixer gain (0-15)')
-    parser.add_argument('--vga', type=int,
-                        help='Airspy VGA gain (0-15)')
-    
-    args = parser.parse_args()
-    
-    # List devices and exit if requested
-    if args.list_devices:
-        list_devices()
-        sys.exit(0)
-    
-    # Load configuration file
-    config_data = load_config(args.config)
-    
-    # Determine device type
-    device_type = args.device
-    if not device_type:
-        if config_data and config_data.get('device'):
-            device_type = config_data['device']
-        else:
-            device_type = 'auto'
-    
-    # Auto-detect device if needed
-    device_args = {}
-    if device_type == 'auto':
-        device_type, device_info = detect_device()
-        # Use detected device info
-        device_args = device_info
-    elif isinstance(device_type, dict):
-        # Device is already a dict from config
-        device_args = device_type
-        device_type = device_args.get('driver', 'unknown')
-    else:
-        device_args['driver'] = device_type
-    
-    # Get configuration for this device type
-    device_config = {}
+def run_direct_streaming(config_data, device_type, device_args, use_agc):
+    """Run direct IQ streaming mode (outputs to stdout)"""
     if config_data:
-        device_config = config_data.get(device_type, {})
-        # Global settings
-        frequency = (args.freq or config_data.get('frequency', 144.8)) * 1e6
+        device_config = config_data
+        frequency = config_data.get('frequency', 144.8) * 1e6
         sample_rate = config_data.get('sample_rate', 192000)
     else:
-        frequency = (args.freq or 144.8) * 1e6
+        device_config = {'gains': {}, 'settings': {}}
+        frequency = 144.8 * 1e6
         sample_rate = 192000
-    
-    # Override config with command-line arguments
-    use_agc = args.agc or device_config.get('agc', False)
-    
-    if args.ifgr is not None:
-        device_config['ifgr'] = args.ifgr
-    if args.rfgr is not None:
-        device_config['rfgr'] = args.rfgr
-    if args.gain is not None:
-        device_config['gain'] = args.gain
-    if args.lna is not None:
-        device_config['lna_gain'] = args.lna
-    if args.mixer is not None:
-        device_config['mixer_gain'] = args.mixer
-    if args.vga is not None:
-        device_config['vga_gain'] = args.vga
     
     log("=" * 60)
     log("SoapySDR to Direwolf IQ Streamer")
@@ -354,7 +293,6 @@ def main():
     log(f"Sample rate: {sample_rate} Hz")
     log(f"AGC: {'ON' if use_agc else 'OFF'}")
     
-    # Open device
     try:
         sdr = SoapySDR.Device(device_args)
     except Exception as e:
@@ -362,15 +300,11 @@ def main():
         log("\nTry running with --list-devices to see available devices")
         sys.exit(1)
     
-    # Configure device
     try:
         sdr.setSampleRate(SOAPY_SDR_RX, 0, sample_rate)
         sdr.setFrequency(SOAPY_SDR_RX, 0, frequency)
-        
-        # Set gains
         setup_device_gains(sdr, device_type, device_config, use_agc)
         
-        # Log actual settings
         log(f"Actual sample rate: {sdr.getSampleRate(SOAPY_SDR_RX, 0)} Hz")
         log(f"Actual frequency: {sdr.getFrequency(SOAPY_SDR_RX, 0)/1e6} MHz")
         
@@ -384,7 +318,6 @@ def main():
         log(f"ERROR: Could not configure device: {e}")
         sys.exit(1)
     
-    # Setup stream
     try:
         rx_stream = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)
         sdr.activateStream(rx_stream)
@@ -398,17 +331,14 @@ def main():
     log("Press Ctrl+C to stop")
     log("=" * 60)
     
-    # Buffer for receiving samples
     buff = np.zeros(4096, dtype=np.complex64)
     
     try:
         while True:
-            # Read samples
             sr = sdr.readStream(rx_stream, [buff], len(buff))
             num_samples = sr.ret
             
             if num_samples > 0:
-                # Write to stdout as interleaved float32 (I,Q,I,Q,...)
                 iq_interleaved = np.empty(num_samples * 2, dtype=np.float32)
                 iq_interleaved[0::2] = buff[:num_samples].real
                 iq_interleaved[1::2] = buff[:num_samples].imag
@@ -428,6 +358,400 @@ def main():
             log("Stream closed")
         except:
             pass
+
+# ============================================================================
+# SECTION 2: Unified Launcher Functions
+# ============================================================================
+
+def find_config_file(config_name):
+    """Find config file in scripts/ or current directory"""
+    if os.path.exists(config_name):
+        return config_name
+    
+    scripts_path = script_dir / config_name
+    if scripts_path.exists():
+        return str(scripts_path)
+    
+    if not config_name.endswith('.conf'):
+        with_ext = f"{config_name}.conf"
+        if os.path.exists(with_ext):
+            return with_ext
+        scripts_with_ext = script_dir / with_ext
+        if scripts_with_ext.exists():
+            return str(scripts_with_ext)
+    
+    return None
+
+def find_direwolf_binary():
+    """Find direwolf binary"""
+    candidates = [
+        './build/src/direwolf',
+        '../build/src/direwolf',
+        'direwolf',
+    ]
+    
+    for candidate in candidates:
+        try:
+            result = subprocess.run([candidate, '-h'], 
+                                    capture_output=True, 
+                                    timeout=1)
+            if result.returncode == 0 or result.returncode == 1:
+                return candidate
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            continue
+    
+    return None
+
+def start_pipeline(sdr_config, direwolf_config, direwolf_binary, use_web=False):
+    """Start the SDR -> direwolf pipeline"""
+    monitor_fifo = None
+    if use_web:
+        monitor_fifo = '/tmp/direwolf_iq_monitor.fifo'
+        try:
+            if os.path.exists(monitor_fifo):
+                os.remove(monitor_fifo)
+            os.mkfifo(monitor_fifo)
+            print(f"Created monitoring FIFO: {monitor_fifo}")
+        except Exception as e:
+            print(f"Warning: couldn't create FIFO: {e}")
+            monitor_fifo = None
+    
+    sample_rate = 192000
+    try:
+        with open(sdr_config, 'r') as f:
+            for line in f:
+                if line.strip().startswith('SAMPLE_RATE'):
+                    sample_rate = int(line.split()[1])
+                    break
+    except:
+        pass
+    
+    decimation = max(1, int(sample_rate / 24000))
+    output_rate = sample_rate // decimation
+    
+    print(f"Pipeline configuration:")
+    print(f"  SDR config: {sdr_config}")
+    print(f"  Direwolf config: {direwolf_config}")
+    print(f"  Sample rate: {sample_rate} Hz")
+    print(f"  Decimation: {decimation}")
+    print(f"  Output rate: {output_rate} Hz")
+    print(f"  Web monitoring: {'enabled' if use_web else 'disabled'}")
+    print()
+    
+    sdr_cmd = [sys.executable, str(script_dir / 'soapysdr_to_direwolf.py'), 
+               '--config', sdr_config]
+    
+    print(f"Starting SDR: {' '.join(sdr_cmd)}")
+    sdr_process = subprocess.Popen(sdr_cmd, stdout=subprocess.PIPE, stderr=sys.stderr)
+    
+    csdr_cmd = ['csdr', 'fir_decimate_cc', str(decimation), '0.005', 'HAMMING']
+    print(f"Starting decimation: {' '.join(csdr_cmd)}")
+    csdr_process = subprocess.Popen(csdr_cmd, stdin=sdr_process.stdout, 
+                                     stdout=subprocess.PIPE, stderr=sys.stderr)
+    sdr_process.stdout.close()
+    
+    if monitor_fifo:
+        tee_cmd = ['tee', monitor_fifo]
+        print(f"Starting tee: {' '.join(tee_cmd)}")
+        tee_process = subprocess.Popen(tee_cmd, stdin=csdr_process.stdout,
+                                        stdout=subprocess.PIPE, stderr=sys.stderr)
+        csdr_process.stdout.close()
+        direwolf_stdin = tee_process.stdout
+    else:
+        tee_process = None
+        direwolf_stdin = csdr_process.stdout
+    
+    direwolf_cmd = [direwolf_binary, '-t', '0', '-r', str(output_rate), 
+                    '-n', '1', f'iq:{output_rate}']
+    
+    if direwolf_config:
+        direwolf_cmd.extend(['-c', direwolf_config])
+    else:
+        direwolf_cmd.append('-M')
+    
+    print(f"Starting direwolf: {' '.join(direwolf_cmd)}")
+    
+    if use_web:
+        direwolf_process = subprocess.Popen(direwolf_cmd, stdin=direwolf_stdin,
+                                             stdout=subprocess.PIPE, 
+                                             stderr=subprocess.STDOUT,
+                                             text=True, bufsize=1)
+    else:
+        direwolf_process = subprocess.Popen(direwolf_cmd, stdin=direwolf_stdin,
+                                             stdout=sys.stdout, stderr=sys.stderr)
+    
+    if tee_process:
+        direwolf_stdin.close()
+        return (sdr_process, csdr_process, tee_process, direwolf_process, monitor_fifo)
+    else:
+        csdr_process.stdout.close()
+        return (sdr_process, csdr_process, None, direwolf_process, monitor_fifo)
+
+def cleanup_pipeline(processes, monitor_fifo):
+    """Clean up pipeline processes and FIFO"""
+    print("\nStopping pipeline...")
+    
+    for process in processes:
+        if process and process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            except:
+                pass
+    
+    if monitor_fifo and os.path.exists(monitor_fifo):
+        try:
+            os.remove(monitor_fifo)
+            print(f"Removed monitoring FIFO: {monitor_fifo}")
+        except:
+            pass
+
+def run_web_interface(sdr_config_path, pipeline_processes, monitor_fifo):
+    """Run the web interface in a separate thread"""
+    from flask import Flask, render_template, jsonify, request
+    from flask_socketio import SocketIO
+    import web_interface
+    
+    direwolf_process = pipeline_processes[-1]
+    
+    web_interface.pipeline_process = direwolf_process
+    web_interface.pipeline_running = True
+    
+    print("Starting pipeline reader thread for packet parsing...")
+    reader_thread = threading.Thread(
+        target=web_interface.pipeline_reader, 
+        args=(direwolf_process,),
+        daemon=True
+    )
+    reader_thread.start()
+    print("Pipeline reader thread started")
+    
+    original_start = web_interface.start_pipeline
+    original_stop = web_interface.stop_pipeline
+    
+    def custom_start():
+        web_interface.pipeline_running = True
+        return {'success': True, 'message': 'Pipeline already running'}
+    
+    def custom_stop():
+        cleanup_pipeline(pipeline_processes, monitor_fifo)
+        web_interface.pipeline_running = False
+        return {'success': True}
+    
+    web_interface.start_pipeline = custom_start
+    web_interface.stop_pipeline = custom_stop
+    
+    import logging
+    logging.getLogger('werkzeug').setLevel(logging.ERROR)
+    logging.getLogger('werkzeug').disabled = True
+    logging.getLogger('socketio').setLevel(logging.ERROR)
+    logging.getLogger('engineio').setLevel(logging.ERROR)
+    
+    print("\n" + "=" * 80)
+    print("Starting Web Interface...")
+    print("Open http://localhost:5000 in your browser")
+    print("=" * 80)
+    
+    web_interface.socketio.run(web_interface.app, host='0.0.0.0', port=5000, 
+                                debug=False, log_output=False, 
+                                allow_unsafe_werkzeug=True)
+
+def run_unified_launcher(args):
+    """Run the unified launcher mode"""
+    if not args.config:
+        print("ERROR: --config is required for launcher mode (or use --web --no-autostart for manual mode)")
+        sys.exit(1)
+    
+    sdr_config = find_config_file(args.config)
+    if not sdr_config:
+        print(f"ERROR: Could not find config file: {args.config}")
+        print("\nAvailable configs in scripts/:")
+        for conf_file in script_dir.glob('*.conf'):
+            print(f"  {conf_file.name}")
+        sys.exit(1)
+    
+    direwolf_binary = find_direwolf_binary()
+    if not direwolf_binary:
+        print("ERROR: Could not find direwolf binary")
+        print("Tried: ./build/src/direwolf, ../build/src/direwolf, direwolf (in PATH)")
+        sys.exit(1)
+    
+    direwolf_config = args.direwolf_config
+    if direwolf_config and not os.path.exists(direwolf_config):
+        print(f"ERROR: Direwolf config not found: {direwolf_config}")
+        sys.exit(1)
+    
+    pipeline_result = start_pipeline(sdr_config, direwolf_config, 
+                                      direwolf_binary, use_web=args.web)
+    
+    if args.web and len(pipeline_result) == 5:
+        sdr_proc, csdr_proc, tee_proc, dw_proc, fifo = pipeline_result
+        processes = [p for p in [sdr_proc, csdr_proc, tee_proc, dw_proc] if p]
+        
+        import web_interface
+        monitor_thread = threading.Thread(target=web_interface.continuous_rssi_monitor, 
+                                          daemon=True)
+        monitor_thread.start()
+        
+        time.sleep(2)
+        
+        def signal_handler(sig, frame):
+            cleanup_pipeline(processes, fifo)
+            sys.exit(0)
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        
+        try:
+            run_web_interface(sdr_config, processes, fifo)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            cleanup_pipeline(processes, fifo)
+    
+    else:
+        if len(pipeline_result) == 5:
+            sdr_proc, csdr_proc, tee_proc, dw_proc, fifo = pipeline_result
+            processes = [p for p in [sdr_proc, csdr_proc, tee_proc, dw_proc] if p]
+        else:
+            sdr_proc, csdr_proc, tee_proc, dw_proc, fifo = (*pipeline_result, None, None, None)
+            processes = [p for p in [sdr_proc, csdr_proc, tee_proc, dw_proc] if p]
+        
+        def signal_handler(sig, frame):
+            cleanup_pipeline(processes, fifo)
+            sys.exit(0)
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        
+        print("\nPipeline running. Press Ctrl+C to stop.")
+        
+        try:
+            dw_proc.wait()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            cleanup_pipeline(processes, fifo)
+
+# ============================================================================
+# SECTION 3: Main Entry Point
+# ============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Unified SoapySDR to Direwolf launcher',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__)
+    
+    # Direct streaming mode options
+    parser.add_argument('--config', type=str, default='soapysdr.conf',
+                        help='Configuration file or device type')
+    parser.add_argument('--device', type=str,
+                        help='Device type: sdrplay, rtlsdr, airspy, hackrf, or auto')
+    parser.add_argument('--freq', type=float,
+                        help='Frequency in MHz (default: from config or 144.8)')
+    parser.add_argument('--gain', type=float,
+                        help='Gain in dB (device-specific)')
+    parser.add_argument('--agc', action='store_true',
+                        help='Enable automatic gain control')
+    parser.add_argument('--list-devices', action='store_true',
+                        help='List all available devices and exit')
+    
+    # Device-specific options
+    parser.add_argument('--ifgr', type=int,
+                        help='SDRplay IF Gain Reduction (20-59)')
+    parser.add_argument('--rfgr', type=int,
+                        help='SDRplay RF Gain Reduction (0-3)')
+    parser.add_argument('--lna', type=int,
+                        help='Airspy LNA gain (0-15)')
+    parser.add_argument('--mixer', type=int,
+                        help='Airspy Mixer gain (0-15)')
+    parser.add_argument('--vga', type=int,
+                        help='Airspy VGA gain (0-15)')
+    
+    # Unified launcher options
+    parser.add_argument('--launcher', action='store_true',
+                        help='Enable unified launcher mode with optional web interface')
+    parser.add_argument('--direwolf-config', '-d', type=str,
+                        help='Direwolf config file (for launcher mode)')
+    parser.add_argument('--web', '-w', action='store_true',
+                        help='Enable web interface for monitoring (launcher mode)')
+    parser.add_argument('--no-autostart', action='store_true',
+                        help='With --web, start web interface without auto-starting pipeline')
+    parser.add_argument('--list-configs', action='store_true',
+                        help='List available config files and exit')
+    
+    args = parser.parse_args()
+    
+    # List devices
+    if args.list_devices:
+        list_devices()
+        sys.exit(0)
+    
+    # List configs
+    if args.list_configs:
+        print("Available SDR config files:")
+        for conf_file in script_dir.glob('*.conf'):
+            print(f"  {conf_file.name}")
+        sys.exit(0)
+    
+    # Web-only mode (launcher)
+    if args.web and args.no_autostart:
+        import web_interface
+        print("Starting in web-only mode (no pipeline auto-start)")
+        print("=" * 80)
+        print("Web Interface - Manual Mode")
+        print("Open http://localhost:5000 in your browser")
+        print("Use the UI to configure and start the pipeline")
+        print("=" * 80)
+        web_interface.socketio.run(web_interface.app, host='0.0.0.0', port=5000,
+                                    debug=False, log_output=False,
+                                    allow_unsafe_werkzeug=True)
+        return
+    
+    # Unified launcher mode
+    if args.launcher or args.web or args.direwolf_config:
+        run_unified_launcher(args)
+        return
+    
+    # Direct streaming mode (default)
+    config_data = load_config(args.config)
+    
+    device_type = args.device
+    if not device_type:
+        if config_data and config_data.get('device'):
+            device_type = config_data['device']
+        else:
+            device_type = 'auto'
+    
+    device_args = {}
+    if device_type == 'auto':
+        device_type, device_info = detect_device()
+        device_args = device_info
+    elif isinstance(device_type, dict):
+        device_args = device_type
+        device_type = device_args.get('driver', 'unknown')
+    else:
+        device_args['driver'] = device_type
+    
+    if config_data:
+        device_config = config_data
+        if args.freq:
+            config_data['frequency'] = args.freq
+        if args.ifgr is not None:
+            config_data['gains']['IFGR'] = args.ifgr
+        if args.rfgr is not None:
+            config_data['gains']['RFGR'] = args.rfgr
+        if args.gain is not None:
+            config_data['gains']['TUNER'] = args.gain
+    else:
+        device_config = {'gains': {}, 'settings': {}}
+    
+    use_agc = args.agc or (config_data and config_data.get('agc', False))
+    
+    run_direct_streaming(device_config, device_type, device_args, use_agc)
 
 if __name__ == "__main__":
     main()
