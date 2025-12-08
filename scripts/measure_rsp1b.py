@@ -22,9 +22,15 @@ def measure_noise_floor_rsp1b(sample_rates=[250000, 1024000, 2048000]):
     print(f"NumPy: {np.__version__}")
     
     try:
-        # Open RSP1B device
+        # Open RSP1B device - auto-detect serial
         print("\nOpening RSP1B...")
-        sdr = SoapySDR.Device({'driver': 'sdrplay', 'serial': '240200CB60'})
+        # First try to find any SDRplay device
+        devices = SoapySDR.Device.enumerate({'driver': 'sdrplay'})
+        if not devices:
+            raise RuntimeError("No SDRplay devices found!")
+        
+        print(f"Found SDRplay device: {devices[0]}")
+        sdr = SoapySDR.Device(devices[0])
         
         print(f"Device: {sdr.getDriverKey()}")
         print(f"Hardware: {sdr.getHardwareKey()}")
