@@ -50,7 +50,7 @@ def measure_noise_floor_rtl_fm(sample_rate=250000, frequency=144.8, gain=49.6, d
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,  # Ignore stderr (device discovery messages)
             bufsize=0
         )
         
