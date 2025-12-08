@@ -19,7 +19,7 @@ This directory contains Python scripts for streaming IQ data from SDR devices to
 - Device-specific gain controls
 - Better error handling
 
-**Documentation:** See [SOAPYSDR_GUIDE.md](SOAPYSDR_GUIDE.md)
+**Documentation:** See [SOAPYSDR_TO_DIREWOLF.md](SOAPYSDR_TO_DIREWOLF.md)
 
 **Quick start:**
 ```bash
@@ -107,6 +107,6 @@ cat iq48k_cfloat.raw | \
 ## See Also
 
 - [SOAPYSDR_TO_DIREWOLF.md](SOAPYSDR_TO_DIREWOLF.md) - Unified script with launcher and web interface
-- [SOAPYSDR_GUIDE.md](SOAPYSDR_GUIDE.md) - Comprehensive guide for all devices
+- [SoapySDR Documentation](https://github.com/pothosware/SoapySDR/wiki) - Official SoapySDR API and device guides
 - [../IQ_INPUT.md](../IQ_INPUT.md) - Direwolf IQ input documentation
 - [../README.md](../README.md) - Main direwolf documentation

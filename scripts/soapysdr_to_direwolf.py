@@ -508,7 +508,7 @@ def cleanup_pipeline(processes, monitor_fifo):
         except:
             pass
 
-def run_web_interface(sdr_config_path, pipeline_processes, monitor_fifo):
+def run_web_interface(sdr_config_path, direwolf_config, direwolf_binary, pipeline_processes, monitor_fifo):
     """Run the web interface in a separate thread"""
     from flask import Flask, render_template, jsonify, request
     from flask_socketio import SocketIO
@@ -531,12 +531,60 @@ def run_web_interface(sdr_config_path, pipeline_processes, monitor_fifo):
     original_start = web_interface.start_pipeline
     original_stop = web_interface.stop_pipeline
     
+    # Store references to processes in the closure
+    current_processes = {'processes': pipeline_processes, 'fifo': monitor_fifo}
+    
     def custom_start():
-        web_interface.pipeline_running = True
-        return {'success': True, 'message': 'Pipeline already running'}
+        """Restart pipeline with updated config from web interface"""
+        nonlocal current_processes, sdr_config_path
+        
+        print("Restarting pipeline with new configuration...")
+        
+        # Stop current pipeline
+        cleanup_pipeline(current_processes['processes'], current_processes['fifo'])
+        web_interface.pipeline_running = False
+        # Wait for RSSI monitor to detect FIFO removal and close it
+        time.sleep(2)
+        
+        try:
+            # Regenerate SoapySDR config from current web settings
+            new_sdr_config = web_interface.generate_soapysdr_config()
+            sdr_config_path = new_sdr_config
+
+            # Restart pipeline with freshly generated config
+            pipeline_result = start_pipeline(new_sdr_config, direwolf_config, 
+                                           direwolf_binary, use_web=True)
+            
+            if len(pipeline_result) == 5:
+                sdr_proc, csdr_proc, tee_proc, dw_proc, fifo = pipeline_result
+                processes = [p for p in [sdr_proc, csdr_proc, tee_proc, dw_proc] if p]
+                current_processes = {'processes': processes, 'fifo': fifo}
+                
+                # Update references
+                web_interface.pipeline_process = dw_proc
+                web_interface.pipeline_running = True
+                
+                # Restart reader thread
+                reader_thread = threading.Thread(
+                    target=web_interface.pipeline_reader, 
+                    args=(dw_proc,),
+                    daemon=True
+                )
+                reader_thread.start()
+                
+                print("Pipeline restarted successfully")
+                return {'success': True}
+            else:
+                return {'success': False, 'error': 'Failed to start pipeline'}
+                
+        except Exception as e:
+            print(f"Error restarting pipeline: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'success': False, 'error': str(e)}
     
     def custom_stop():
-        cleanup_pipeline(pipeline_processes, monitor_fifo)
+        cleanup_pipeline(current_processes['processes'], current_processes['fifo'])
         web_interface.pipeline_running = False
         return {'success': True}
     
@@ -605,7 +653,7 @@ def run_unified_launcher(args):
         signal.signal(signal.SIGTERM, signal_handler)
         
         try:
-            run_web_interface(sdr_config, processes, fifo)
+            run_web_interface(sdr_config, direwolf_config, direwolf_binary, processes, fifo)
         except KeyboardInterrupt:
             pass
         finally:

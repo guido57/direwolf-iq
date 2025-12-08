@@ -313,50 +313,72 @@ def continuous_rssi_monitor():
     while True:
         if pipeline_running:
             try:
+                # Check if FIFO exists
+                if not os.path.exists(monitor_fifo):
+                    print(f"RSSI monitor: waiting for FIFO {monitor_fifo} to be created...")
+                    time.sleep(0.5)
+                    continue
+                
                 # Calculate output rate after decimation
                 decimation = max(1, int(config['sample_rate'] / 24000))
                 output_rate = config['sample_rate'] // decimation
                 
-                # Open FIFO for reading IQ samples
-                with open(monitor_fifo, 'rb') as fifo:
-                    print(f"RSSI monitor: reading from {monitor_fifo} at {output_rate} Hz")
-                    while pipeline_running:
-                        # Read 100ms of IQ data: output_rate * 0.1s samples * 8 bytes (CF32)
-                        samples_per_100ms = int(output_rate * 0.1)
-                        chunk_size = samples_per_100ms * 8
-                        data = fifo.read(chunk_size)
-                        
-                        if len(data) < chunk_size:
-                            break
-                        
-                        # Parse CF32 (float32 I, float32 Q interleaved)
-                        num_floats = len(data) // 4
-                        samples = struct.unpack(f'<{num_floats}f', data)
-                        
-                        # Convert to complex
-                        iq = np.array(samples, dtype=np.float32)
-                        iq_complex = iq[0::2] + 1j * iq[1::2]
-                        
-                        # Compute power in dBFS
-                        power = np.mean(np.abs(iq_complex)**2)
-                        if power > 0:
-                            rssi_dbfs = 10 * np.log10(power)
-                        else:
-                            rssi_dbfs = -100
-                        
-                        rssi_dbfs = max(-100, min(0, rssi_dbfs))
-                        
-                        timestamp = datetime.now().isoformat()
-                        stats['continuous_rssi'].append({
-                            'time': timestamp,
-                            'value': rssi_dbfs
-                        })
-                        
-                        # Emit to clients
-                        socketio.emit('continuous_rssi', {
-                            'time': timestamp,
-                            'value': rssi_dbfs
-                        })
+                print(f"RSSI monitor: opening FIFO {monitor_fifo}...")
+                # Open FIFO with non-blocking mode first to avoid hanging
+                fd = os.open(monitor_fifo, os.O_RDONLY | os.O_NONBLOCK)
+                # Switch back to blocking mode for actual reads
+                import fcntl
+                flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+                fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+                # Convert to regular file object
+                fifo = os.fdopen(fd, 'rb')
+                print(f"RSSI monitor: successfully opened, reading at {output_rate} Hz")
+                
+                while pipeline_running:
+                    # Check if FIFO still exists (might be deleted during restart)
+                    if not os.path.exists(monitor_fifo):
+                        print("RSSI monitor: FIFO removed, reopening...")
+                        break
+                    
+                    # Read 100ms of IQ data: output_rate * 0.1s samples * 8 bytes (CF32)
+                    samples_per_100ms = int(output_rate * 0.1)
+                    chunk_size = samples_per_100ms * 8
+                    data = fifo.read(chunk_size)
+                    
+                    if len(data) < chunk_size:
+                        print("RSSI monitor: EOF or incomplete data, reopening...")
+                        break
+                    
+                    # Parse CF32 (float32 I, float32 Q interleaved)
+                    num_floats = len(data) // 4
+                    samples = struct.unpack(f'<{num_floats}f', data)
+                    
+                    # Convert to complex
+                    iq = np.array(samples, dtype=np.float32)
+                    iq_complex = iq[0::2] + 1j * iq[1::2]
+                    
+                    # Compute power in dBFS
+                    power = np.mean(np.abs(iq_complex)**2)
+                    if power > 0:
+                        rssi_dbfs = 10 * np.log10(power)
+                    else:
+                        rssi_dbfs = -100
+                    
+                    rssi_dbfs = max(-100, min(0, rssi_dbfs))
+                    
+                    timestamp = datetime.now().isoformat()
+                    stats['continuous_rssi'].append({
+                        'time': timestamp,
+                        'value': rssi_dbfs
+                    })
+                    
+                    # Emit to clients
+                    socketio.emit('continuous_rssi', {
+                        'time': timestamp,
+                        'value': rssi_dbfs
+                    })
+                
+                fifo.close()
                         
             except FileNotFoundError:
                 print(f"RSSI monitor: waiting for FIFO {monitor_fifo}")
@@ -372,8 +394,19 @@ def start_pipeline():
     global pipeline_process, pipeline_running
     
     with pipeline_lock:
-        if pipeline_running:
+        if pipeline_running and pipeline_process:
             return {'success': False, 'error': 'Pipeline already running'}
+        
+        # Ensure clean state
+        if pipeline_process is not None:
+            try:
+                pipeline_process.kill()
+                pipeline_process.wait(timeout=2)
+            except:
+                pass
+            pipeline_process = None
+        
+        pipeline_running = False
         
         try:
             # Create named pipe for monitoring
@@ -443,9 +476,22 @@ def stop_pipeline():
         
         try:
             if pipeline_process:
+                # Try graceful termination first
                 pipeline_process.terminate()
-                pipeline_process.wait(timeout=5)
+                try:
+                    pipeline_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    # Force kill if terminate didn't work
+                    print("Pipeline didn't terminate gracefully, forcing kill...")
+                    pipeline_process.kill()
+                    pipeline_process.wait(timeout=2)
+                
+                pipeline_process = None
+            
             pipeline_running = False
+            
+            # Give time for threads to finish reading
+            time.sleep(0.5)
             
             # Clean up monitoring FIFO
             monitor_fifo = '/tmp/direwolf_iq_monitor.fifo'
@@ -457,10 +503,15 @@ def stop_pipeline():
             except Exception as e:
                 print(f"Warning: couldn't remove FIFO: {e}")
             
+            print("Pipeline stopped successfully")
             return {'success': True}
         except Exception as e:
             if pipeline_process:
-                pipeline_process.kill()
+                try:
+                    pipeline_process.kill()
+                except:
+                    pass
+                pipeline_process = None
             pipeline_running = False
             return {'success': False, 'error': str(e)}
 
@@ -572,12 +623,40 @@ def update_config():
     print(f"Updated config: {config}")
     
     # Restart pipeline if running
-    if pipeline_running:
-        stop_pipeline()
-        time.sleep(1)
-        start_pipeline()
+    was_running = pipeline_running
+    restart_status = None
     
-    return jsonify({'success': True, 'config': config})
+    if was_running:
+        print("Restarting pipeline with new config...")
+        try:
+            result = stop_pipeline()
+            print(f"Stop result: {result}")
+            
+            if result['success']:
+                print("Pipeline stopped, waiting before restart...")
+                time.sleep(2)  # Wait longer for cleanup
+                print("Starting pipeline after config change...")
+                result = start_pipeline()
+                print(f"Start result: {result}")
+                
+                if not result['success']:
+                    restart_status = f"Failed to restart: {result.get('error', 'Unknown error')}"
+                    print(restart_status)
+                    return jsonify({'success': False, 'error': restart_status, 'config': config})
+                else:
+                    print("Pipeline restarted successfully")
+            else:
+                restart_status = f"Failed to stop pipeline: {result.get('error', 'Unknown error')}"
+                print(restart_status)
+                return jsonify({'success': False, 'error': restart_status, 'config': config})
+        except Exception as e:
+            error_msg = f"Exception during restart: {str(e)}"
+            print(error_msg)
+            import traceback
+            traceback.print_exc()
+            return jsonify({'success': False, 'error': error_msg, 'config': config})
+    
+    return jsonify({'success': True, 'config': config, 'restarted': was_running})
 
 @app.route('/api/preset/<device>', methods=['GET'])
 def load_preset(device):
