@@ -1,30 +1,36 @@
 #!/usr/bin/env python3
 """
-Comprehensive RTL-SDR comparison test
-Measures noise floor with identical settings
+Noise floor diagnostic for SDRs (RTL-SDR, SDRplay, etc.)
+Measures dBFS noise floor using SoapySDR with identical settings.
+Select device via --device rtlsdr|sdrplay and optional device-specific gains.
 """
 
 import SoapySDR
-from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CF32
+from SoapySDR import SOAPY_SDR_RX
 import numpy as np
 import time
 import sys
 import platform
+import argparse
 
-def measure_noise_floor():
-    """Measure noise floor with fixed settings"""
+def measure_noise_floor(args):
+    """Measure noise floor with selected device and settings"""
     
+    print("[diag] Entering measure_noise_floor()")
     print("="*70)
-    print("RTL-SDR Noise Floor Diagnostic")
+    print("SDR Noise Floor Diagnostic")
     print("="*70)
     print(f"Platform: {platform.system()} {platform.machine()}")
     print(f"Python: {sys.version.split()[0]}")
     print(f"NumPy: {np.__version__}")
     
-    # Fixed test parameters
-    FREQUENCY = 144.8e6
-    SAMPLE_RATE = 250000
-    GAIN = 49.6
+    # Parameters from CLI
+    FREQUENCY = args.freq * 1e6
+    SAMPLE_RATE = int(args.rate)
+    DEVICE = args.device
+    # Generic gain (RTL-SDR tuner dB or SDRplay IFGR)
+    GAIN = float(args.gain)
+    RFGR = int(args.rfgr) if args.rfgr is not None else None
     
     print(f"\nTest parameters:")
     print(f"  Frequency: {FREQUENCY/1e6} MHz")
@@ -32,15 +38,40 @@ def measure_noise_floor():
     print(f"  Gain: {GAIN} dB")
     
     # Open device
-    print("\nOpening RTL-SDR...")
-    sdr = SoapySDR.Device({'driver': 'rtlsdr'})
+    print(f"\nOpening SDR: {DEVICE}...")
+    sdr = SoapySDR.Device({'driver': DEVICE})
     
     # Configure
     sdr.setSampleRate(SOAPY_SDR_RX, 0, SAMPLE_RATE)
     sdr.setFrequency(SOAPY_SDR_RX, 0, FREQUENCY)
     sdr.setGainMode(SOAPY_SDR_RX, 0, False)
-    sdr.setGain(SOAPY_SDR_RX, 0, GAIN)
+    # Device-specific gain handling
+    if DEVICE == 'rtlsdr':
+        sdr.setGain(SOAPY_SDR_RX, 0, GAIN)
+        try:
+            sdr.writeSetting('digital_agc', 'false')
+            sdr.writeSetting('offset_tune', 'false')
+        except Exception:
+            pass
+    elif DEVICE == 'sdrplay':
+        # SDRplay uses IFGR/RFGR; set if provided
+        try:
+            sdr.setGain(SOAPY_SDR_RX, 0, 'IFGR', int(GAIN))
+        except Exception:
+            # Fallback to generic gain setter
+            sdr.setGain(SOAPY_SDR_RX, 0, GAIN)
+        if RFGR is not None:
+            try:
+                sdr.setGain(SOAPY_SDR_RX, 0, 'RFGR', RFGR)
+            except Exception:
+                pass
     
+    # Harden device settings (explicitly disable optional DSP that can vary)
+    try:
+        sdr.writeSetting('biastee', 'false')
+    except Exception:
+        pass
+
     # Read back actual settings
     actual_rate = sdr.getSampleRate(SOAPY_SDR_RX, 0)
     actual_freq = sdr.getFrequency(SOAPY_SDR_RX, 0)
@@ -65,15 +96,31 @@ def measure_noise_floor():
     except:
         pass
     
-    # Setup stream
+    # Setup stream with explicit buffer sizing to reduce overflows
     print("\nStarting stream...")
-    rx_stream = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)
+    # Use string format 'CF32' per SoapySDR Python API; kwargs values as strings
+    # Smaller buffers + more ring buffers tend to behave better on some hosts
+    stream_args = {'bufflen': '16384', 'buffers': '16', 'asyncBuffs': '4'}
+    try:
+        rx_stream = sdr.setupStream(SOAPY_SDR_RX, 'CF32', [0], stream_args)
+    except TypeError:
+        # Fallback without kwargs
+        rx_stream = sdr.setupStream(SOAPY_SDR_RX, 'CF32', [0])
     sdr.activateStream(rx_stream)
     
     # Warmup
-    buff = np.zeros(4096, dtype=np.complex64)
+    buff = np.zeros(2048, dtype=np.complex64)
+    timeout_us = 1000000  # 1000 ms timeout: long enough, reduces stalls
+    warm_ok = 0
     for _ in range(10):
-        sdr.readStream(rx_stream, [buff], len(buff))
+        sr = sdr.readStream(rx_stream, [buff], len(buff), timeoutUs=timeout_us)
+        if sr.ret > 0:
+            warm_ok += 1
+        elif sr.ret == 0:
+            # timeout, continue trying
+            continue
+        else:
+            print(f"  Warmup read error: {sr.ret}")
     
     time.sleep(0.5)
     
@@ -82,28 +129,46 @@ def measure_noise_floor():
     powers = []
     
     for i in range(20):
-        sr = sdr.readStream(rx_stream, [buff], len(buff))
-        if sr.ret > 0:
-            samples = buff[:sr.ret]
-            
-            # Multiple power calculation methods
-            power_rms = np.mean(np.abs(samples)**2)
-            power_peak = np.max(np.abs(samples)**2)
-            
-            if power_rms > 0:
-                power_dbfs = 10 * np.log10(power_rms)
-                powers.append(power_dbfs)
-                
-                if i % 5 == 0:
-                    print(f"  Sample {i+1:2d}: {power_dbfs:.2f} dBFS")
-        
+        # Try a few times per sample to ride out transient overflows
+        attempt = 0
+        got_data = False
+        while attempt < 3 and not got_data:
+            sr = sdr.readStream(rx_stream, [buff], len(buff), timeoutUs=timeout_us)
+            if sr.ret > 0:
+                samples = buff[:sr.ret]
+                power_rms = np.mean(np.abs(samples)**2)
+                if power_rms > 0:
+                    power_dbfs = 10 * np.log10(power_rms)
+                    powers.append(power_dbfs)
+                    if i % 5 == 0 and attempt == 0:
+                        print(f"  Sample {i+1:2d}: {power_dbfs:.2f} dBFS")
+                got_data = True
+            elif sr.ret == 0:
+                # timeout, retry
+                attempt += 1
+                continue
+            else:
+                # overflow or other error; retry a couple times before logging
+                attempt += 1
+                if attempt >= 3:
+                    print(f"  Read error: {sr.ret}")
+        if not got_data:
+            powers.append(np.nan)
         time.sleep(0.05)
     
     # Statistics
-    avg_power = np.mean(powers)
-    std_power = np.std(powers)
-    min_power = np.min(powers)
-    max_power = np.max(powers)
+    # Filter out NaNs from timeouts
+    valid = [p for p in powers if not np.isnan(p)]
+    if valid:
+        avg_power = np.mean(valid)
+        std_power = np.std(valid)
+        min_power = np.min(valid)
+        max_power = np.max(valid)
+    else:
+        avg_power = float('nan')
+        std_power = float('nan')
+        min_power = float('nan')
+        max_power = float('nan')
     
     print("\n" + "="*70)
     print("RESULTS:")
@@ -115,14 +180,33 @@ def measure_noise_floor():
     print("="*70)
     
     # Cleanup
-    sdr.deactivateStream(rx_stream)
-    sdr.closeStream(rx_stream)
+    try:
+        sdr.deactivateStream(rx_stream)
+    except Exception:
+        pass
+    try:
+        sdr.closeStream(rx_stream)
+    except Exception:
+        pass
     
     return avg_power
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='SDR Noise Floor Diagnostic')
+    parser.add_argument('--device', choices=['rtlsdr', 'sdrplay'], default='rtlsdr', help='SDR driver')
+    parser.add_argument('--freq', type=float, default=144.8, help='Frequency in MHz')
+    parser.add_argument('--rate', type=int, default=250000, help='Sample rate in Hz')
+    parser.add_argument('--gain', type=float, default=49.6, help='Gain: RTL tuner dB or SDRplay IFGR')
+    parser.add_argument('--rfgr', type=int, help='SDRplay RF Gain Reduction (0-3)')
+    args = parser.parse_args()
+
     try:
-        measure_noise_floor()
+        try:
+            SoapySDR.setLogLevel(SoapySDR.SOAPY_SDR_WARNING)
+        except Exception:
+            pass
+        print("[diag] Starting noise floor diagnostic script")
+        measure_noise_floor(args)
     except KeyboardInterrupt:
         print("\nAborted by user")
     except Exception as e:

@@ -326,10 +326,6 @@ def run_direct_streaming(config_data, device_type, device_args, use_agc):
         sys.exit(1)
     
     log("=" * 60)
-    log(f"Streaming IQ samples to stdout (CF32 @ {sample_rate} Hz)...")
-    log("Pipe to: csdr fir_decimate_cc 8 | direwolf -M -t 0 -r 24000 -n 1 iq:24000")
-    log("Press Ctrl+C to stop")
-    log("=" * 60)
     
     buff = np.zeros(4096, dtype=np.complex64)
     
@@ -472,10 +468,16 @@ def start_pipeline(sdr_config, direwolf_config, direwolf_binary, use_web=False):
     print(f"Starting direwolf: {' '.join(direwolf_cmd)}")
     
     if use_web:
-        direwolf_process = subprocess.Popen(direwolf_cmd, stdin=direwolf_stdin,
-                                             stdout=subprocess.PIPE, 
-                                             stderr=subprocess.STDOUT,
-                                             text=True, bufsize=1)
+        direwolf_process = subprocess.Popen(
+            direwolf_cmd,
+            stdin=direwolf_stdin,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding='latin-1',
+            errors='replace',
+            bufsize=1
+        )
     else:
         direwolf_process = subprocess.Popen(direwolf_cmd, stdin=direwolf_stdin,
                                              stdout=sys.stdout, stderr=sys.stderr)

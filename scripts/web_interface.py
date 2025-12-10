@@ -39,7 +39,8 @@ config = {
     'rfgr': 0,       # SDRplay RF Gain Reduction (0-3)
     'agc': False,
     'filter_quality': 'high',  # 'standard' or 'high'
-    'decimation': 64  # Calculated based on sample rate
+    'decimation': 64,  # Calculated based on sample rate
+    'color_output': True  # Colorize console output
 }
 
 # Statistics
@@ -61,14 +62,23 @@ stats = {
 }
 
 def parse_direwolf_line(line):
-    """Parse direwolf output line for packet info."""
-    # Example: [0.2] IR5AO>APMI04,IR5X,IZ5OQO-11,WIDE2*:... [RSSI=-28.1 dBFS (S9+19), SNR=32.0 dB]
+    """Parse direwolf output line for packet info.
+    Accepts lines with or without trailing [RSSI=..., SNR=...] metrics.
+    """
+    # Common example with metrics:
+    #   [0.2] CALLSIGN>DEST,PATH*:payload [RSSI=-28.1 dBFS (S9+19), SNR=32.0 dB]
+    # And without metrics:
+    #   [0.2] CALLSIGN>DEST,PATH*:payload
     
-    packet_match = re.search(r'\[[\d.]+\]\s+([^>]+)>([^:]+):(.*?)\s*\[RSSI=', line)
-    metric_match = re.search(r'\[RSSI=([-\d.]+)\s+dBFS.*?SNR=([\d.]+)\s+dB\]', line)
+    # Try to capture sender, path and message regardless of metrics presence
+    packet_match = re.search(r'\[[\d.]+\]\s+([^>]+)>([^:]+):(.*?)(?:\s*\[RSSI=|$)', line)
+    metric_match = re.search(r'\[RSSI=([\-\d.]+)\s+dBFS.*?SNR=([\d.]+)\s+dB\]', line)
     
     if not packet_match:
-        return None
+        # Fallback: lines without leading timestamp bracket
+        packet_match = re.search(r'^\s*([^>]+)>([^:]+):(.*)$', line)
+        if not packet_match:
+            return None
     
     sender = packet_match.group(1)
     path = packet_match.group(2)
@@ -125,6 +135,36 @@ def parse_audio_level(line):
     if match:
         return int(match.group(1))
     return None
+
+# Simple ANSI colorizer for console output when Direwolf is piped
+ANSI = {
+    'reset': "\x1b[0m",
+    'red': "\x1b[31m",
+    'yellow': "\x1b[33m",
+    'green': "\x1b[32m",
+    'cyan': "\x1b[36m",
+    'blue': "\x1b[34m",
+    'dim': "\x1b[2m",
+}
+
+def colorize_console_line(line, packet=None, audio_level=None):
+    if not config.get('color_output', True):
+        return line
+    lo = line.lower()
+    color = None
+    if 'error' in lo:
+        color = 'red'
+    elif 'warning' in lo or 'obsolete' in lo:
+        color = 'yellow'
+    elif audio_level is not None or 'audio level' in lo:
+        color = 'blue'
+    elif packet is not None:
+        color = 'green'
+    elif any(k in lo for k in ['starting', 'device:', 'sample rate', 'iq input mode', 'fm demodulator']):
+        color = 'cyan'
+    if color:
+        return f"{ANSI[color]}{line}{ANSI['reset']}"
+    return line
 
 def generate_soapysdr_config():
     """Generate a temporary SoapySDR config file from current settings."""
@@ -235,15 +275,13 @@ def pipeline_reader(process):
             break
         
         line = line.strip()
-        # Print direwolf output to console
-        print(line)
-        
-        # Parse audio level for continuous monitoring
+        # Parse audio level and packet before printing so we can colorize
         audio_level = parse_audio_level(line)
         if audio_level is not None:
             stats['last_audio_level'] = audio_level
-        
         packet = parse_direwolf_line(line)
+        # Print direwolf output to console with optional colors
+        print(colorize_console_line(line, packet=packet, audio_level=audio_level))
         
         if packet:
             # Enhance packet with peak RSSI/SNR from continuous monitoring
@@ -310,6 +348,7 @@ def continuous_rssi_monitor():
     
     monitor_fifo = '/tmp/direwolf_iq_monitor.fifo'
     
+    keepalive_fd = None
     while True:
         if pipeline_running:
             try:
@@ -318,6 +357,14 @@ def continuous_rssi_monitor():
                     print(f"RSSI monitor: waiting for FIFO {monitor_fifo} to be created...")
                     time.sleep(0.5)
                     continue
+
+                # Open a persistent keepalive read handle so writers never see zero readers
+                if keepalive_fd is None:
+                    try:
+                        keepalive_fd = os.open(monitor_fifo, os.O_RDONLY | os.O_NONBLOCK)
+                        # Do not read from keepalive_fd; it's only to prevent writer EPIPE
+                    except Exception as e:
+                        print(f"RSSI monitor: keepalive open failed: {e}")
                 
                 # Calculate output rate after decimation
                 decimation = max(1, int(config['sample_rate'] / 24000))
@@ -334,44 +381,57 @@ def continuous_rssi_monitor():
                 fifo = os.fdopen(fd, 'rb')
                 print(f"RSSI monitor: successfully opened, reading at {output_rate} Hz")
                 
+                # Buffer reads to avoid spurious EOF/incomplete chunks
+                buf = bytearray()
                 while pipeline_running:
                     # Check if FIFO still exists (might be deleted during restart)
                     if not os.path.exists(monitor_fifo):
                         print("RSSI monitor: FIFO removed, reopening...")
                         break
-                    
+
                     # Read 100ms of IQ data: output_rate * 0.1s samples * 8 bytes (CF32)
                     samples_per_100ms = int(output_rate * 0.1)
                     chunk_size = samples_per_100ms * 8
-                    data = fifo.read(chunk_size)
-                    
-                    if len(data) < chunk_size:
-                        print("RSSI monitor: EOF or incomplete data, reopening...")
+
+                    # Fill buffer until we have a full chunk or hit EOF
+                    while len(buf) < chunk_size and pipeline_running:
+                        data = fifo.read(chunk_size - len(buf))
+                        if data is None:
+                            # Should not happen with blocking reads, yield briefly
+                            time.sleep(0.01)
+                            continue
+                        if len(data) == 0:
+                            # True EOF – likely pipeline restart; reopen outer loop
+                            print("RSSI monitor: EOF, reopening...")
+                            break
+                        buf.extend(data)
+
+                    if len(buf) < chunk_size:
+                        # Not enough data to process; reopen FIFO
                         break
-                    
+
+                    chunk = bytes(buf[:chunk_size])
+                    del buf[:chunk_size]
+
                     # Parse CF32 (float32 I, float32 Q interleaved)
-                    num_floats = len(data) // 4
-                    samples = struct.unpack(f'<{num_floats}f', data)
-                    
+                    num_floats = len(chunk) // 4
+                    samples = struct.unpack(f'<{num_floats}f', chunk)
+
                     # Convert to complex
                     iq = np.array(samples, dtype=np.float32)
                     iq_complex = iq[0::2] + 1j * iq[1::2]
-                    
+
                     # Compute power in dBFS
                     power = np.mean(np.abs(iq_complex)**2)
-                    if power > 0:
-                        rssi_dbfs = 10 * np.log10(power)
-                    else:
-                        rssi_dbfs = -100
-                    
+                    rssi_dbfs = 10 * np.log10(power) if power > 0 else -100
                     rssi_dbfs = max(-100, min(0, rssi_dbfs))
-                    
+
                     timestamp = datetime.now().isoformat()
                     stats['continuous_rssi'].append({
                         'time': timestamp,
                         'value': rssi_dbfs
                     })
-                    
+
                     # Emit to clients
                     socketio.emit('continuous_rssi', {
                         'time': timestamp,
@@ -379,6 +439,7 @@ def continuous_rssi_monitor():
                     })
                 
                 fifo.close()
+                # Do not close keepalive_fd here; it stays open to keep writer alive
                         
             except FileNotFoundError:
                 print(f"RSSI monitor: waiting for FIFO {monitor_fifo}")
@@ -387,6 +448,13 @@ def continuous_rssi_monitor():
                 print(f"RSSI monitor error: {e}")
                 time.sleep(1)
         else:
+            # Pipeline stopped: cleanup keepalive handle if present
+            if keepalive_fd is not None:
+                try:
+                    os.close(keepalive_fd)
+                except Exception:
+                    pass
+                keepalive_fd = None
             time.sleep(0.5)
 
 def start_pipeline():
@@ -434,11 +502,17 @@ def start_pipeline():
             sdr_cmd = f"python3 scripts/soapysdr_to_direwolf.py --config {sdr_config}"
             
             # Add tee after decimation (at direwolf input) for accurate RSSI measurement
+            # Prefer repo direwolf config to avoid default search failures
+            dw_conf = os.path.join(os.getcwd(), 'conf', 'sdr.conf')
+            dw_conf_arg = f"-c {dw_conf}" if os.path.exists(dw_conf) else ""
+            if not dw_conf_arg:
+                print("WARNING: conf/sdr.conf not found; Direwolf will use defaults.")
+
             full_cmd = (
                 f"{sdr_cmd} 2>/dev/null | "
                 f"csdr fir_decimate_cc {filter_arg} 2>/dev/null | "
                 f"tee {monitor_fifo} | "
-                f"./build/src/direwolf -M -t 0 -r {output_rate} -n 1 iq:{output_rate} 2>&1"
+                f"./build/src/direwolf {dw_conf_arg} -M -t 0 -r {output_rate} -n 1 iq:{output_rate} 2>&1"
             )
             
             print(f"Starting pipeline with command: {full_cmd}")
@@ -451,6 +525,8 @@ def start_pipeline():
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding='latin-1',
+                errors='replace',
                 bufsize=1
             )
             
