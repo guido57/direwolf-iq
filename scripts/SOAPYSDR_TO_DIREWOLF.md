@@ -173,6 +173,22 @@ When `--web` is used, the FIFO lets the web interface read IQ samples for the co
 
 The `iq_lowpass.py` stage implements an additional complex FIR low-pass, controlled by the "Channel Bandwidth" selector in the web UI.
 
+High-level view of Mode 3 (launcher + web):
+
+```
+Antenna
+  ↓
+SDR (SoapySDR device)
+  ↓
+Decimator (csdr fir_decimate_cc)
+  ↓
+Low-pass FIR (iq_lowpass.py)
+  ↓
+Direwolf (IQ input, demod + decode)
+  ↓
+Web Interface (Flask/Socket.IO dashboard)
+```
+
 ## Watchdog and Logging
 
 - A built-in watchdog in `run_direct_streaming()` monitors SoapySDR reads:
