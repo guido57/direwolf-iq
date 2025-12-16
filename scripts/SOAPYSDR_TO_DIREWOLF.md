@@ -35,6 +35,20 @@ python3 scripts/soapysdr_to_direwolf.py --config rtlsdr.conf --launcher
 python3 scripts/soapysdr_to_direwolf.py --config rsp1.conf --launcher --direwolf-config ~/direwolf.conf
 ```
 
+Pipeline for Mode 2 (launcher, no web):
+
+```
+SoapySDR device (sample_rate from *.conf)
+  ↓
+soapysdr_to_direwolf.py  (direct IQ stream, watchdog, logging)
+  ↓
+csdr fir_decimate_cc <decimation> 0.005 HAMMING
+  ↓
+Direwolf iq:<output_rate>  (≈ 24 kHz complex IQ)
+```
+
+Here `decimation` is chosen so that `output_rate = SAMPLE_RATE // decimation` is close to 24000 Hz.
+
 ### Mode 3: Web Interface Mode
 
 Launch with real-time web monitoring:
@@ -51,6 +65,24 @@ Then open http://localhost:5000 in your browser.
 - Live charts with collision-avoiding labels
 - Statistics persist even when browser is closed
  - "Channel Bandwidth" control (24k/12k/8k/6k/4k) backed by a Python FIR (`iq_lowpass.py`)
+
+Pipeline for Mode 3 (launcher + web):
+
+```
+SoapySDR device (sample_rate from *.conf)
+  ↓
+soapysdr_to_direwolf.py  (direct IQ stream, watchdog, logging)
+  ↓
+csdr fir_decimate_cc <decimation> 0.005 HAMMING
+  ↓
+iq_lowpass.py --rate <output_rate> --mode <24k|12k|8k|6k|4k>
+  ↓
+tee /tmp/direwolf_iq_monitor.fifo
+  ↓
+Direwolf iq:<output_rate>
+```
+
+When `--web` is used, the FIFO lets the web interface read IQ samples for the continuous RSSI chart while Direwolf continues decoding packets. The `iq_lowpass.py` stage implements an additional complex FIR low-pass, controlled by the "Channel Bandwidth" selector in the web UI.
 
 ## Configuration Files
 
@@ -124,42 +156,6 @@ List available configs:
 ```bash
 python3 scripts/soapysdr_to_direwolf.py --list-configs
 ```
-
-## Pipeline Architecture
-
-### Launcher (no web)
-
-```
-SoapySDR device (sample_rate from *.conf)
-  ↓
-soapysdr_to_direwolf.py  (direct IQ stream, watchdog, logging)
-  ↓
-csdr fir_decimate_cc <decimation> 0.005 HAMMING
-  ↓
-Direwolf iq:<output_rate>  (≈ 24 kHz complex IQ)
-```
-
-`decimation` is chosen so that `output_rate = SAMPLE_RATE // decimation` is close to 24000 Hz.
-
-### Launcher + Web Interface
-
-```
-SoapySDR device (sample_rate from *.conf)
-  ↓
-soapysdr_to_direwolf.py  (direct IQ stream, watchdog, logging)
-  ↓
-csdr fir_decimate_cc <decimation> 0.005 HAMMING
-  ↓
-iq_lowpass.py --rate <output_rate> --mode <24k|12k|8k|6k|4k>
-  ↓
-tee /tmp/direwolf_iq_monitor.fifo
-  ↓
-Direwolf iq:<output_rate>
-```
-
-When `--web` is used, the FIFO lets the web interface read IQ samples for the continuous RSSI chart while Direwolf continues decoding packets.
-
-The `iq_lowpass.py` stage implements an additional complex FIR low-pass, controlled by the "Channel Bandwidth" selector in the web UI.
 
 High-level view of Mode 3 (launcher + web):
 
