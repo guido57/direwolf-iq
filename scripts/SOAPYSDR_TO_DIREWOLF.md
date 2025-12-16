@@ -84,6 +84,29 @@ Direwolf iq:<output_rate>
 
 When `--web` is used, the FIFO lets the web interface read IQ samples for the continuous RSSI chart while Direwolf continues decoding packets. The `iq_lowpass.py` stage implements an additional complex FIR low-pass, controlled by the "Channel Bandwidth" selector in the web UI.
 
+High-level view of Mode 3 (launcher + web):
+
+```
+  +---------+      +--------------------------------------------+      +-------------------------------------------+
+  | Antenna | ---> | SDR (SoapySDR dev, e.g. RTL-SDR 250k–2.048M) | ---> | Decimator (csdr fir_dec..., to 24 kS/s) |
+  +---------+      +--------------------------------------------+      +-------------------------------------------+
+                                                             |
+                                                             v
+                                  +-------------------------------------------+
+                                  | Low-pass FIR (iq_lowpass.py, 24k..4k)    |
+                                  +-------------------------------------------+
+                                                             |
+                                                             v
+                     +------------------------------------------------+
+                     | Direwolf (IQ input @ 24 kS/s, demod + decode) |
+                     +------------------------------------------------+
+                               |                               |
+                               v                               v
+      +---------------------------------------+   +-----------------------------+
+      | Web Interface (Flask/Socket.IO UI)   |   | Console (Direwolf stdout)   |
+      +---------------------------------------+   +-----------------------------+
+```
+
 ## Configuration Files
 
 Example configs live in `scripts/`:
@@ -155,29 +178,6 @@ python3 scripts/soapysdr_to_direwolf.py --launcher --web --no-autostart
 List available configs:
 ```bash
 python3 scripts/soapysdr_to_direwolf.py --list-configs
-```
-
-High-level view of Mode 3 (launcher + web):
-
-```
-  +---------+      +--------------------------------------------+      +-------------------------------------------+
-  | Antenna | ---> | SDR (SoapySDR dev, e.g. RTL-SDR 250k–2.048M) | ---> | Decimator (csdr fir_dec..., to 24 kS/s) |
-  +---------+      +--------------------------------------------+      +-------------------------------------------+
-                                                             |
-                                                             v
-                                  +-------------------------------------------+
-                                  | Low-pass FIR (iq_lowpass.py, 24k..4k)    |
-                                  +-------------------------------------------+
-                                                             |
-                                                             v
-                     +------------------------------------------------+
-                     | Direwolf (IQ input @ 24 kS/s, demod + decode) |
-                     +------------------------------------------------+
-                               |                               |
-                               v                               v
-      +---------------------------------------+   +-----------------------------+
-      | Web Interface (Flask/Socket.IO UI)   |   | Console (Direwolf stdout)   |
-      +---------------------------------------+   +-----------------------------+
 ```
 
 ## Watchdog and Logging
