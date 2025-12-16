@@ -68,44 +68,33 @@ Then open http://localhost:5000 in your browser.
 
 Pipeline for Mode 3 (launcher + web):
 
-```
-SoapySDR device (sample_rate from *.conf)
-  ↓
-soapysdr_to_direwolf.py  (direct IQ stream, watchdog, logging)
-  ↓
-csdr fir_decimate_cc <decimation> 0.005 HAMMING
-  ↓
-iq_lowpass.py --rate <output_rate> --mode <24k|12k|8k|6k|4k>
-  ↓
-tee /tmp/direwolf_iq_monitor.fifo
-  ↓
-Direwolf iq:<output_rate>
-```
-
-When `--web` is used, the FIFO lets the web interface read IQ samples for the continuous RSSI chart while Direwolf continues decoding packets. The `iq_lowpass.py` stage implements an additional complex FIR low-pass, controlled by the "Channel Bandwidth" selector in the web UI.
-
-High-level view of Mode 3 (launcher + web):
-
-```
-  +---------+      +--------------------------------------------+      +-------------------------------------------+
-  | Antenna | ---> | SDR (SoapySDR dev, e.g. RTL-SDR 250k–2.048M) | ---> | Decimator (csdr fir_dec..., to 24 kS/s) |
-  +---------+      +--------------------------------------------+      +-------------------------------------------+
-                                                             |
-                                                             v
-                                  +-------------------------------------------+
-                                  | Low-pass FIR (iq_lowpass.py, 24k..4k)    |
-                                  +-------------------------------------------+
-                                                             |
-                                                             v
+  +---------+      +--------  ------------------------------------+      
+  | Antenna | ---> | SDR (SoapySDR dev, e.g. RTL-SDR 250k–2.048M) |  
+  +---------+      +----------------------------------------------+      
+                                |
+                                v
+     +-------------------------------------------+
+     | Decimator (csdr fir_dec..., to 24 kS/s)   |
+     +-------------------------------------------+
+                                |
+                                v
+     +-------------------------------------------+
+     | Low-pass FIR (iq_lowpass.py, 24k..4k)     |
+     +-------------------------------------------+
+                                |
+                                v
                      +------------------------------------------------+
-                     | Direwolf (IQ input @ 24 kS/s, demod + decode) |
+                     | Direwolf (IQ input @ 24 kS/s, demod + decode)  |
                      +------------------------------------------------+
                                |                               |
                                v                               v
       +---------------------------------------+   +-----------------------------+
-      | Web Interface (Flask/Socket.IO UI)   |   | Console (Direwolf stdout)   |
+      | Web Interface (Flask/Socket.IO UI)    |   | Console (Direwolf stdout)   |
       +---------------------------------------+   +-----------------------------+
 ```
+
+When `--web` is used, the FIFO lets the web interface read IQ samples for the continuous RSSI chart while Direwolf continues decoding packets. The `iq_lowpass.py` stage implements an additional complex FIR low-pass, controlled by the "Channel Bandwidth" selector in the web UI.
+
 
 ## Configuration Files
 
@@ -116,12 +105,12 @@ Example configs live in `scripts/`:
 
 Common keys understood by `soapysdr_to_direwolf.py`:
 
-- `DEVICE` – SoapySDR device string, e.g. `driver=rtlsdr` or `driver=sdrplay`
-- `FREQUENCY` – Center frequency in MHz (e.g. `144.800`)
+- `DEVICE`      – SoapySDR device string, e.g. `driver=rtlsdr` or `driver=sdrplay`
+- `FREQUENCY`   – Center frequency in MHz (e.g. `144.800`)
 - `SAMPLE_RATE` – Complex sample rate in Hz from the SDR (e.g. `1024000` or `2048000`)
-- `BANDWIDTH` – Default channel bandwidth mode for the web UI: `24k,12k,8k,6k,4k`
-- `AGC` – `true/false` to enable/disable device AGC
-- `GAIN ...` – Device-specific gain lines, e.g. `GAIN TUNER 35.0` for RTL-SDR or `GAIN IFGR 35` / `GAIN RFGR 0` for SDRplay
+- `BANDWIDTH`   – Default channel bandwidth mode for the web UI: `24k,12k,8k,6k,4k`
+- `AGC`         – `true/false` to enable/disable device AGC
+- `GAIN ...`    – Device-specific gain lines, e.g. `GAIN TUNER 35.0` for RTL-SDR or `GAIN IFGR 35` / `GAIN RFGR 0` for SDRplay
 - `SETTING ...` – Additional SoapySDR driver settings, e.g. `SETTING offset_tune false`
 
 ## Command-Line Options
