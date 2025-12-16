@@ -2,11 +2,10 @@
 
 `soapysdr_to_direwolf.py` is a unified script that ties SoapySDR-based devices into Direwolf.
 
-It provides four closely related modes:
+It provides three closely related modes:
 1. **Direct streaming**: Pipe IQ samples to other tools via stdout
 2. **Command-line launcher**: Run complete pipeline (SDR → decimation → Direwolf)
 3. **Launcher + web interface**: Full monitoring dashboard with real-time statistics
-4. **Web-only**: Start the web UI without auto-starting the RF pipeline
 
 All modes share the same SoapySDR configuration files and logging.
 
@@ -52,17 +51,6 @@ Then open http://localhost:5000 in your browser.
 - Live charts with collision-avoiding labels
 - Statistics persist even when browser is closed
  - "Channel Bandwidth" control (24k/12k/8k/6k/4k) backed by a Python FIR (`iq_lowpass.py`)
-
-### Mode 4: Web-Only Mode (Manual Start)
-
-Start web interface without auto-starting pipeline:
-```bash
-python3 scripts/soapysdr_to_direwolf.py --launcher --web --no-autostart
-```
-
-Use the web UI controls to manually configure and start the pipeline.
-
-In this mode the UI can generate a fresh SoapySDR config (including center frequency, sample rate, AGC and bandwidth preset) and then start the full pipeline on demand.
 
 ## Configuration Files
 
