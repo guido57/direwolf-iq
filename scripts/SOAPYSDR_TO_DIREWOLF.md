@@ -67,7 +67,7 @@ Then open http://localhost:5000 in your browser.
  - "Channel Bandwidth" control (24k/12k/8k/6k/4k) backed by a Python FIR (`iq_lowpass.py`)
 
 Pipeline for Mode 3 (launcher + web):
-
+```
   +---------+      +--------  ------------------------------------+      
   | Antenna | ---> | SDR (SoapySDR dev, e.g. RTL-SDR 250k–2.048M) |  
   +---------+      +----------------------------------------------+      
