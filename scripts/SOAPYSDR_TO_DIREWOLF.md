@@ -176,17 +176,19 @@ The `iq_lowpass.py` stage implements an additional complex FIR low-pass, control
 High-level view of Mode 3 (launcher + web):
 
 ```
-Antenna
-  ↓
-SDR (SoapySDR device)
-  ↓
-Decimator (csdr fir_decimate_cc)
-  ↓
-Low-pass FIR (iq_lowpass.py)
-  ↓
-Direwolf (IQ input, demod + decode)
-  ↓
-Web Interface (Flask/Socket.IO dashboard)
+  +---------+      +----------------------+      +------------------------------+
+  | Antenna | ---> |  SDR (SoapySDR dev) | ---> | Decimator (csdr fir_dec...) |
+  +---------+      +----------------------+      +------------------------------+
+                                                             |
+                                                             v
+                                  +-------------------------------------------+
+                                  | Low-pass FIR (iq_lowpass.py, 24k..4k)    |
+                                  +-------------------------------------------+
+                                                             |
+                                                             v
+                     +----------------------------------------------+      +---------------------------------------+
+                     | Direwolf (IQ input, FM demod + AX.25 decode) | ---> | Web Interface (Flask/Socket.IO UI)   |
+                     +----------------------------------------------+      +---------------------------------------+
 ```
 
 ## Watchdog and Logging
