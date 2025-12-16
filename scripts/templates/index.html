@@ -133,6 +133,23 @@
             color: #999;
             border-bottom: 2px solid #444;
         }
+        .station-header div {
+            cursor: pointer;
+            user-select: none;
+            position: relative;
+            padding-right: 14px;
+        }
+        .station-header div.sorted-asc::after,
+        .station-header div.sorted-desc::after {
+            position: absolute;
+            right: 2px;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 10px;
+            color: #ccc;
+        }
+        .station-header div.sorted-asc::after { content: '▲'; }
+        .station-header div.sorted-desc::after { content: '▼'; }
         .direct-badge {
             background: #4CAF50;
             color: white;
@@ -218,10 +235,13 @@
                     <input type="number" id="rfgr" min="0" max="3" value="0">
                 </div>
                 <div class="control-group">
-                    <label>Filter Quality</label>
+                    <label>Channel Bandwidth</label>
                     <select id="filter">
-                        <option value="standard">Standard</option>
-                        <option value="high" selected>High (0.005)</option>
+                        <option value="24k" selected>24 kHz (no extra LPF)</option>
+                        <option value="12k">12 kHz</option>
+                        <option value="8k">8 kHz</option>
+                        <option value="6k">6 kHz</option>
+                        <option value="4k">4 kHz</option>
                     </select>
                 </div>
                 <div class="control-group">
@@ -266,12 +286,12 @@
                 <h2>Station List</h2>
                 <div class="station-list">
                     <div class="station-item station-header">
-                        <div>Callsign</div>
-                        <div>RSSI</div>
-                        <div>SNR</div>
-                        <div>Count</div>
-                        <div>Last Heard</div>
-                        <div>Via</div>
+                        <div data-sort-key="callsign" onclick="setStationSort('callsign')">Callsign</div>
+                        <div data-sort-key="rssi" onclick="setStationSort('rssi')">RSSI</div>
+                        <div data-sort-key="snr" onclick="setStationSort('snr')">SNR</div>
+                        <div data-sort-key="count" onclick="setStationSort('count')">Count</div>
+                        <div data-sort-key="last_seen" onclick="setStationSort('last_seen')">Last Heard</div>
+                        <div data-sort-key="via" onclick="setStationSort('via')">Via</div>
                     </div>
                     <div id="stationList"></div>
                 </div>
@@ -286,6 +306,23 @@
     <script>
         const socket = io();
         let continuousRssiChart;
+        // Station list state for client-side sorting
+        let stationData = [];
+        let stationSortKey = 'callsign';
+        let stationSortDir = 'asc';  // 'asc' or 'desc'
+
+        function normalizeCallsignForSort(callsign) {
+            if (!callsign) return '';
+            let t = String(callsign).trim();
+            // Strip leading bracketed tag like "[0L] " or "[ig] "
+            if (t.startsWith('[')) {
+                const spaceIdx = t.indexOf(' ');
+                if (spaceIdx > 0) {
+                    t = t.slice(spaceIdx + 1).trim();
+                }
+            }
+            return t.toUpperCase();
+        }
         
         // Custom plugin to draw callsign labels below packet markers with collision avoidance
         const packetLabelPlugin = {
@@ -654,13 +691,97 @@
                 alert('Failed to apply settings: ' + data.error);
             }
         }
-        
-        async function loadStations() {
-            const response = await fetch('/api/stations');
-            const stations = await response.json();
+
+        function updateStationHeaderSortIndicators() {
+            const header = document.querySelector('.station-item.station-header');
+            if (!header) return;
+            const cells = header.querySelectorAll('div[data-sort-key]');
+            cells.forEach(cell => {
+                cell.classList.remove('sorted-asc', 'sorted-desc');
+                const key = cell.getAttribute('data-sort-key');
+                if (key === stationSortKey) {
+                    cell.classList.add(stationSortDir === 'asc' ? 'sorted-asc' : 'sorted-desc');
+                }
+            });
+        }
+
+        function setStationSort(key) {
+            if (stationSortKey === key) {
+                // Toggle direction
+                stationSortDir = stationSortDir === 'asc' ? 'desc' : 'asc';
+            } else {
+                stationSortKey = key;
+                // Default direction depends on column type
+                if (key === 'rssi' || key === 'snr' || key === 'count' || key === 'last_seen') {
+                    // For numeric / time columns, show highest / newest first by default
+                    stationSortDir = 'desc';
+                } else {
+                    // Text columns default to A->Z
+                    stationSortDir = 'asc';
+                }
+            }
+            renderStations();
+        }
+
+        function renderStations() {
             const list = document.getElementById('stationList');
-            
-            list.innerHTML = stations.map(s => {
+            if (!list) return;
+
+            const data = [...stationData];
+
+            const key = stationSortKey;
+            const dir = stationSortDir === 'asc' ? 1 : -1;
+
+            data.sort((a, b) => {
+                let va, vb;
+                // Primary key comparison
+                if (key === 'rssi' || key === 'snr' || key === 'count') {
+                    va = a[key];
+                    vb = b[key];
+                    const aMissing = (va === null || va === undefined);
+                    const bMissing = (vb === null || vb === undefined);
+                    if (!aMissing || !bMissing) {
+                        if (aMissing) return 1;   // missing -> bottom
+                        if (bMissing) return -1;
+                        const nva = Number(va);
+                        const nvb = Number(vb);
+                        if (nva < nvb) return -1 * dir;
+                        if (nva > nvb) return 1 * dir;
+                    }
+                } else if (key === 'last_seen') {
+                    va = a.last_seen || '';
+                    vb = b.last_seen || '';
+                    if (va || vb) {
+                        if (!va) return 1;   // missing -> bottom
+                        if (!vb) return -1;
+                        if (va < vb) return -1 * dir;
+                        if (va > vb) return 1 * dir;
+                    }
+                } else if (key === 'via') {
+                    va = (a.via || '').toUpperCase();
+                    vb = (b.via || '').toUpperCase();
+                    if (va < vb) return -1 * dir;
+                    if (va > vb) return 1 * dir;
+                } else { // 'callsign' or default
+                    va = normalizeCallsignForSort(a.callsign);
+                    vb = normalizeCallsignForSort(b.callsign);
+                    if (va < vb) return -1 * dir;
+                    if (va > vb) return 1 * dir;
+                }
+
+                // Tie-breaker: always callsign A->Z, then via A->Z
+                const ca = normalizeCallsignForSort(a.callsign);
+                const cb = normalizeCallsignForSort(b.callsign);
+                if (ca < cb) return -1;
+                if (ca > cb) return 1;
+                const vaStr = (a.via || '').toUpperCase();
+                const vbStr = (b.via || '').toUpperCase();
+                if (vaStr < vbStr) return -1;
+                if (vaStr > vbStr) return 1;
+                return 0;
+            });
+
+            list.innerHTML = data.map(s => {
                 const lastHeard = s.last_seen ? new Date(s.last_seen).toLocaleTimeString() : '-';
                 const isDirect = (s.via === 'Direct');
                 return `
@@ -678,6 +799,15 @@
                 </div>
                 `;
             }).join('');
+
+            updateStationHeaderSortIndicators();
+        }
+        
+        async function loadStations() {
+            const response = await fetch('/api/stations');
+            const stations = await response.json();
+            stationData = Array.isArray(stations) ? stations : [];
+            renderStations();
         }
         
         async function loadPackets() {
@@ -766,7 +896,7 @@
                     document.getElementById('ifgr').value = cfg.ifgr || 40;
                     document.getElementById('rfgr').value = cfg.rfgr || 0;
                     document.getElementById('agc').value = String(cfg.agc || false);
-                    document.getElementById('filter').value = cfg.filter_quality || 'high';
+                    document.getElementById('filter').value = cfg.filter_quality || '24k';
                     updateGainInfo();
                     console.log(`Loaded preset for ${device}:`, cfg);
                     return true;
@@ -788,13 +918,21 @@
             try {
                 const response = await fetch('/api/config');
                 const cfg = await response.json();
-                document.getElementById('device').value = cfg.device || 'rtlsdr';
-                document.getElementById('frequency').value = cfg.frequency || 144.8;
-                document.getElementById('sample_rate').value = cfg.sample_rate || 1024000;
-                document.getElementById('ifgr').value = cfg.ifgr || 40;
-                document.getElementById('rfgr').value = cfg.rfgr || 0;
-                document.getElementById('agc').value = String(cfg.agc || false);
-                document.getElementById('filter').value = cfg.filter_quality || 'high';
+                const device = cfg.device || 'rtlsdr';
+                document.getElementById('device').value = device;
+
+                // Prefer preset values from the device .conf file on initial load.
+                const usedPreset = await loadPreset(device);
+
+                if (!usedPreset) {
+                    // Fallback: use config values from backend
+                    document.getElementById('frequency').value = cfg.frequency || 144.8;
+                    document.getElementById('sample_rate').value = cfg.sample_rate || 1024000;
+                    document.getElementById('ifgr').value = cfg.ifgr || 40;
+                    document.getElementById('rfgr').value = cfg.rfgr || 0;
+                    document.getElementById('agc').value = String(cfg.agc || false);
+                    document.getElementById('filter').value = cfg.filter_quality || '24k';
+                }
                 updateGainInfo();
             } catch (e) {
                 console.error('Failed to load config', e);

@@ -16,12 +16,23 @@ import re
 import json
 import time
 import os
+import logging
 from datetime import datetime
 from collections import defaultdict, deque
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'direwolf-sdr-secret'
 socketio = SocketIO(app, cors_allowed_origins="*")
+
+# File-based logger so errors don't get lost in console scroll
+LOG_FILE = os.path.join(os.path.dirname(__file__), 'direwolf_iq.log')
+logger = logging.getLogger('direwolf_iq')
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    _handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
+    _formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+    _handler.setFormatter(_formatter)
+    logger.addHandler(_handler)
 
 # Global state
 pipeline_process = None
@@ -30,6 +41,8 @@ pipeline_lock = threading.Lock()
 
 # Configuration
 # Now uses SoapySDR config files for multi-device support
+# Use ~24 kHz IQ into Direwolf; extra Python FIR can narrow to 12/8/6/4 kHz.
+TARGET_OUTPUT_RATE = 24000  # Desired Direwolf input rate in Hz
 config = {
     'device': 'rtlsdr',  # Device type: 'rtlsdr', 'sdrplay', 'airspy', 'hackrf'
     'frequency': 144.8,  # 2m APRS frequency
@@ -38,7 +51,8 @@ config = {
     'ifgr': 40,      # Gain for RTL-SDR (0-50) or SDRplay IFGR (20-59)
     'rfgr': 0,       # SDRplay RF Gain Reduction (0-3)
     'agc': False,
-    'filter_quality': 'high',  # 'standard' or 'high'
+    # Interpreted as channel bandwidth selector for Python FIR: '24k','12k','8k','6k','4k'
+    'filter_quality': '24k',
     'decimation': 64,  # Calculated based on sample rate
     'color_output': True  # Colorize console output
 }
@@ -170,9 +184,9 @@ def generate_soapysdr_config():
     """Generate a temporary SoapySDR config file from current settings."""
     config_path = '/tmp/web_interface_sdr.conf'
     
-    # Determine sample rate decimation for output
-    # After decimation, want ~24kHz output
-    decimation = max(1, int(config['sample_rate'] / 24000))
+    # Determine sample rate decimation for output (informational only)
+    # After decimation, we target ~8 kHz output
+    decimation = max(1, int(config['sample_rate'] / TARGET_OUTPUT_RATE))
     
     # Build config content
     config_content = f"""# Auto-generated config for web interface
@@ -269,74 +283,95 @@ def enhance_packet_with_peak_rssi(packet):
 def pipeline_reader(process):
     """Read direwolf output and update statistics."""
     global stats
-    
-    for line in iter(process.stdout.readline, ''):
-        if not line:
+    logger.info("pipeline_reader: started")
+
+    for raw_line in iter(process.stdout.readline, ''):
+        if not raw_line:
             break
-        
-        line = line.strip()
-        # Parse audio level and packet before printing so we can colorize
-        audio_level = parse_audio_level(line)
-        if audio_level is not None:
-            stats['last_audio_level'] = audio_level
-        packet = parse_direwolf_line(line)
-        # Print direwolf output to console with optional colors
-        print(colorize_console_line(line, packet=packet, audio_level=audio_level))
-        
-        if packet:
-            # Enhance packet with peak RSSI/SNR from continuous monitoring
-            packet = enhance_packet_with_peak_rssi(packet)
-            
-            stats['packets_received'] += 1
-            stats['last_packets'].append(packet)
-            
-            sender = packet['sender']
-            
-            stats['stations_heard'].add(sender)
-            
-            if packet['direct']:
-                stats['direct_rf_senders'].add(sender)
-            
-            # Initialize station entry if needed
-            if sender not in stats['station_list']:
-                stats['station_list'][sender] = {
-                    'first_seen': packet['timestamp'],
-                    'direct': {'count': 0, 'last_seen': None, 'rssi': None, 'snr': None},
-                    'via': {}
-                }
+        try:
+            line = raw_line.strip()
 
-            # Update direct or via-digipeater bucket
-            if packet['direct']:
-                bucket = stats['station_list'][sender]['direct']
+            # Log every Direwolf line to file, with basic severity guess
+            lo = line.lower()
+            if 'error' in lo or 'exception' in lo:
+                logger.error(line)
+            elif 'warning' in lo:
+                logger.warning(line)
             else:
-                digi = packet['last_digipeater'] or 'Unknown'
-                if digi not in stats['station_list'][sender]['via']:
-                    stats['station_list'][sender]['via'][digi] = {'count': 0, 'last_seen': None, 'rssi': None, 'snr': None}
-                bucket = stats['station_list'][sender]['via'][digi]
+                logger.info(line)
 
-            bucket['count'] = bucket['count'] + 1
-            bucket['last_seen'] = packet['timestamp']
-            bucket['rssi'] = packet['rssi']
-            bucket['snr'] = packet['snr']
+            # Parse audio level and packet before printing so we can colorize
+            audio_level = parse_audio_level(line)
+            if audio_level is not None:
+                stats['last_audio_level'] = audio_level
+            packet = parse_direwolf_line(line)
+
+            # Print direwolf output to console with optional colors
+            print(colorize_console_line(line, packet=packet, audio_level=audio_level))
             
-            # Update metrics history
-            if packet['rssi'] is not None:
-                stats['rssi_history'].append({
-                    'time': packet['timestamp'],
-                    'value': packet['rssi'],
-                    'station': sender
-                })
-            
-            if packet['snr'] is not None:
-                stats['snr_history'].append({
-                    'time': packet['timestamp'],
-                    'value': packet['snr'],
-                    'station': sender
-                })
-            
-            # Emit to connected clients
-            socketio.emit('new_packet', packet)
-            socketio.emit('stats_update', get_stats())
+            if packet:
+                # Enhance packet with peak RSSI/SNR from continuous monitoring
+                packet = enhance_packet_with_peak_rssi(packet)
+                
+                stats['packets_received'] += 1
+                stats['last_packets'].append(packet)
+                
+                sender = packet['sender']
+                
+                stats['stations_heard'].add(sender)
+                
+                if packet['direct']:
+                    stats['direct_rf_senders'].add(sender)
+                
+                # Initialize station entry if needed
+                if sender not in stats['station_list']:
+                    stats['station_list'][sender] = {
+                        'first_seen': packet['timestamp'],
+                        'direct': {'count': 0, 'last_seen': None, 'rssi': None, 'snr': None},
+                        'via': {}
+                    }
+
+                # Update direct or via-digipeater bucket
+                if packet['direct']:
+                    bucket = stats['station_list'][sender]['direct']
+                else:
+                    digi = packet['last_digipeater'] or 'Unknown'
+                    if digi not in stats['station_list'][sender]['via']:
+                        stats['station_list'][sender]['via'][digi] = {
+                            'count': 0,
+                            'last_seen': None,
+                            'rssi': None,
+                            'snr': None
+                        }
+                    bucket = stats['station_list'][sender]['via'][digi]
+
+                bucket['count'] = bucket['count'] + 1
+                bucket['last_seen'] = packet['timestamp']
+                bucket['rssi'] = packet['rssi']
+                bucket['snr'] = packet['snr']
+                
+                # Update metrics history
+                if packet['rssi'] is not None:
+                    stats['rssi_history'].append({
+                        'time': packet['timestamp'],
+                        'value': packet['rssi'],
+                        'station': sender
+                    })
+                
+                if packet['snr'] is not None:
+                    stats['snr_history'].append({
+                        'time': packet['timestamp'],
+                        'value': packet['snr'],
+                        'station': sender
+                    })
+                
+                # Emit to connected clients
+                socketio.emit('new_packet', packet)
+                socketio.emit('stats_update', get_stats())
+        except Exception:
+            logger.exception("pipeline_reader: error while processing line")
+
+    logger.info("pipeline_reader: stopped")
 
 # Signal power monitoring using tee to tap the pipeline
 def continuous_rssi_monitor():
@@ -354,7 +389,7 @@ def continuous_rssi_monitor():
             try:
                 # Check if FIFO exists
                 if not os.path.exists(monitor_fifo):
-                    print(f"RSSI monitor: waiting for FIFO {monitor_fifo} to be created...")
+                    # FIFO not yet created; wait quietly
                     time.sleep(0.5)
                     continue
 
@@ -364,88 +399,95 @@ def continuous_rssi_monitor():
                         keepalive_fd = os.open(monitor_fifo, os.O_RDONLY | os.O_NONBLOCK)
                         # Do not read from keepalive_fd; it's only to prevent writer EPIPE
                     except Exception as e:
-                        print(f"RSSI monitor: keepalive open failed: {e}")
+                        # Only report actual errors
+                        logger.warning(f"RSSI monitor: keepalive open failed: {e}")
                 
-                # Calculate output rate after decimation
-                decimation = max(1, int(config['sample_rate'] / 24000))
+                # Calculate output rate after decimation (match main pipeline, ~24 kHz)
+                decimation = max(1, int(config['sample_rate'] / TARGET_OUTPUT_RATE))
                 output_rate = config['sample_rate'] // decimation
                 
-                print(f"RSSI monitor: opening FIFO {monitor_fifo}...")
-                # Open FIFO with non-blocking mode first to avoid hanging
-                fd = os.open(monitor_fifo, os.O_RDONLY | os.O_NONBLOCK)
-                # Switch back to blocking mode for actual reads
-                import fcntl
-                flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-                fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
-                # Convert to regular file object
-                fifo = os.fdopen(fd, 'rb')
-                print(f"RSSI monitor: successfully opened, reading at {output_rate} Hz")
-                
-                # Buffer reads to avoid spurious EOF/incomplete chunks
-                buf = bytearray()
-                while pipeline_running:
-                    # Check if FIFO still exists (might be deleted during restart)
-                    if not os.path.exists(monitor_fifo):
-                        print("RSSI monitor: FIFO removed, reopening...")
-                        break
+                fifo = None
+                try:
+                    # Open FIFO with non-blocking mode first to avoid hanging
+                    fd = os.open(monitor_fifo, os.O_RDONLY | os.O_NONBLOCK)
+                    # Switch back to blocking mode for actual reads
+                    import fcntl
+                    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+                    fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+                    # Convert to regular file object
+                    fifo = os.fdopen(fd, 'rb')
 
-                    # Read 100ms of IQ data: output_rate * 0.1s samples * 8 bytes (CF32)
-                    samples_per_100ms = int(output_rate * 0.1)
-                    chunk_size = samples_per_100ms * 8
-
-                    # Fill buffer until we have a full chunk or hit EOF
-                    while len(buf) < chunk_size and pipeline_running:
-                        data = fifo.read(chunk_size - len(buf))
-                        if data is None:
-                            # Should not happen with blocking reads, yield briefly
-                            time.sleep(0.01)
-                            continue
-                        if len(data) == 0:
-                            # True EOF – likely pipeline restart; reopen outer loop
-                            print("RSSI monitor: EOF, reopening...")
+                    # Buffer reads to avoid spurious EOF/incomplete chunks
+                    buf = bytearray()
+                    while pipeline_running:
+                        # Check if FIFO still exists (might be deleted during restart)
+                        if not os.path.exists(monitor_fifo):
+                            logger.info("RSSI monitor: FIFO removed, reopening...")
                             break
-                        buf.extend(data)
 
-                    if len(buf) < chunk_size:
-                        # Not enough data to process; reopen FIFO
-                        break
+                        # Read 100ms of IQ data: output_rate * 0.1s samples * 8 bytes (CF32)
+                        samples_per_100ms = int(output_rate * 0.1)
+                        chunk_size = samples_per_100ms * 8
 
-                    chunk = bytes(buf[:chunk_size])
-                    del buf[:chunk_size]
+                        # Fill buffer until we have a full chunk or hit EOF
+                        while len(buf) < chunk_size and pipeline_running:
+                            data = fifo.read(chunk_size - len(buf))
+                            if data is None:
+                                # Should not happen with blocking reads, yield briefly
+                                time.sleep(0.01)
+                                continue
+                            if len(data) == 0:
+                                # True EOF – likely pipeline restart; reopen outer loop
+                                break
+                            buf.extend(data)
 
-                    # Parse CF32 (float32 I, float32 Q interleaved)
-                    num_floats = len(chunk) // 4
-                    samples = struct.unpack(f'<{num_floats}f', chunk)
+                        if len(buf) < chunk_size:
+                            # Not enough data to process; reopen FIFO
+                            break
 
-                    # Convert to complex
-                    iq = np.array(samples, dtype=np.float32)
-                    iq_complex = iq[0::2] + 1j * iq[1::2]
+                        chunk = bytes(buf[:chunk_size])
+                        del buf[:chunk_size]
 
-                    # Compute power in dBFS
-                    power = np.mean(np.abs(iq_complex)**2)
-                    rssi_dbfs = 10 * np.log10(power) if power > 0 else -100
-                    rssi_dbfs = max(-100, min(0, rssi_dbfs))
+                        # Parse CF32 (float32 I, float32 Q interleaved)
+                        num_floats = len(chunk) // 4
+                        samples = struct.unpack(f'<{num_floats}f', chunk)
 
-                    timestamp = datetime.now().isoformat()
-                    stats['continuous_rssi'].append({
-                        'time': timestamp,
-                        'value': rssi_dbfs
-                    })
+                        # Convert to complex
+                        iq = np.array(samples, dtype=np.float32)
+                        iq_complex = iq[0::2] + 1j * iq[1::2]
 
-                    # Emit to clients
-                    socketio.emit('continuous_rssi', {
-                        'time': timestamp,
-                        'value': rssi_dbfs
-                    })
-                
-                fifo.close()
+                        # Compute power in dBFS
+                        power = np.mean(np.abs(iq_complex)**2)
+                        rssi_dbfs = 10 * np.log10(power) if power > 0 else -100
+                        rssi_dbfs = max(-100, min(0, rssi_dbfs))
+
+                        timestamp = datetime.now().isoformat()
+                        stats['continuous_rssi'].append({
+                            'time': timestamp,
+                            'value': rssi_dbfs
+                        })
+
+                        # Emit to clients; errors here should not stop FIFO draining
+                        try:
+                            socketio.emit('continuous_rssi', {
+                                'time': timestamp,
+                                'value': rssi_dbfs
+                            })
+                        except Exception:
+                            logger.exception("RSSI monitor: error emitting continuous_rssi")
+                finally:
+                    if fifo is not None:
+                        try:
+                            fifo.close()
+                        except Exception:
+                            pass
                 # Do not close keepalive_fd here; it stays open to keep writer alive
                         
             except FileNotFoundError:
-                print(f"RSSI monitor: waiting for FIFO {monitor_fifo}")
+                # FIFO not available yet; wait quietly
                 time.sleep(1)
-            except Exception as e:
-                print(f"RSSI monitor error: {e}")
+            except Exception:
+                logger.exception("RSSI monitor: unexpected error")
                 time.sleep(1)
         else:
             # Pipeline stopped: cleanup keepalive handle if present
@@ -491,8 +533,8 @@ def start_pipeline():
             sdr_config = generate_soapysdr_config()
             print(f"Generated SoapySDR config: {sdr_config}")
             
-            # Calculate decimation and output rate
-            decimation = max(1, int(config['sample_rate'] / 24000))
+            # Calculate decimation and output rate (target ~6 kHz)
+            decimation = max(1, int(config['sample_rate'] / TARGET_OUTPUT_RATE))
             output_rate = config['sample_rate'] // decimation
             
             # Build command with generic SoapySDR interface
@@ -626,7 +668,7 @@ def load_device_preset(device_name):
             'ifgr': 40,
             'rfgr': 0,
             'agc': False,
-            'filter_quality': 'high',
+            'filter_quality': '24k',
         }
         
         with open(config_file, 'r') as f:
@@ -657,12 +699,48 @@ def load_device_preset(device_name):
                             preset['rfgr'] = int(float(gain_value))
                         elif gain_name.upper() == 'TUNER':
                             preset['ifgr'] = int(float(gain_value))
+                elif key == 'BANDWIDTH':
+                    # Map BANDWIDTH value directly to filter_quality for web UI
+                    bw = value.strip().lower()
+                    # Accept forms like 24k or 24000
+                    if bw.endswith('k'):
+                        preset['filter_quality'] = bw
+                    else:
+                        try:
+                            hz = int(float(bw))
+                            if hz >= 22000:
+                                preset['filter_quality'] = '24k'
+                            elif hz >= 11000:
+                                preset['filter_quality'] = '12k'
+                            elif hz >= 7000:
+                                preset['filter_quality'] = '8k'
+                            elif hz >= 5000:
+                                preset['filter_quality'] = '6k'
+                            else:
+                                preset['filter_quality'] = '4k'
+                        except Exception:
+                            pass
         
         print(f"Loaded device preset for {device_name} from {config_file}: {preset}")
         return preset
     except Exception as e:
         print(f"Warning: Could not load preset from {config_file}: {e}")
         return None
+
+# Initialize backend config from preset at startup so that /api/config
+# reflects the device-specific defaults (frequency, sample rate, bandwidth).
+_initial_preset = load_device_preset(config['device'])
+if _initial_preset:
+    try:
+        config['frequency'] = _initial_preset.get('frequency', config['frequency'])
+        config['sample_rate'] = _initial_preset.get('sample_rate', config['sample_rate'])
+        config['ifgr'] = _initial_preset.get('ifgr', config['ifgr'])
+        config['rfgr'] = _initial_preset.get('rfgr', config['rfgr'])
+        config['agc'] = _initial_preset.get('agc', config['agc'])
+        config['filter_quality'] = _initial_preset.get('filter_quality', config['filter_quality'])
+        print(f"Initialized backend config from preset for {config['device']}: {config}")
+    except Exception as e:
+        print(f"Warning: Could not apply initial preset to config: {e}")
 
 @app.route('/api/config', methods=['GET'])
 def get_config():

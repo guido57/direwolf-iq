@@ -32,6 +32,7 @@ import signal
 import subprocess
 import threading
 import time
+import logging
 from pathlib import Path
 
 import SoapySDR
@@ -41,13 +42,31 @@ from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CF32
 script_dir = Path(__file__).parent.absolute()
 sys.path.insert(0, str(script_dir))
 
+# Shared file-based logger (matches web_interface.py: direwolf_iq.log)
+LOG_FILE = os.path.join(os.path.dirname(__file__), 'direwolf_iq.log')
+_logger = logging.getLogger('direwolf_iq')
+if not _logger.handlers:
+    _logger.setLevel(logging.INFO)
+    _handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
+    _formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+    _handler.setFormatter(_formatter)
+    _logger.addHandler(_handler)
+
 # ============================================================================
 # SECTION 1: Direct Streaming Functions
 # ============================================================================
 
 def log(msg):
-    """Print to stderr so it doesn't interfere with IQ data on stdout"""
-    print(msg, file=sys.stderr)
+    """Print to stderr and also append to the shared log file."""
+    try:
+        print(msg, file=sys.stderr)
+    except Exception:
+        pass
+    try:
+        # Treat all messages as INFO; prefixes like WARNING/ERROR are in text.
+        _logger.info(str(msg))
+    except Exception:
+        pass
 
 def list_devices():
     """List all available SoapySDR devices"""
@@ -293,67 +312,97 @@ def run_direct_streaming(config_data, device_type, device_args, use_agc):
     log(f"Sample rate: {sample_rate} Hz")
     log(f"AGC: {'ON' if use_agc else 'OFF'}")
     
-    try:
-        sdr = SoapySDR.Device(device_args)
-    except Exception as e:
-        log(f"ERROR: Could not open device: {e}")
-        log("\nTry running with --list-devices to see available devices")
-        sys.exit(1)
-    
-    try:
-        sdr.setSampleRate(SOAPY_SDR_RX, 0, sample_rate)
-        sdr.setFrequency(SOAPY_SDR_RX, 0, frequency)
-        setup_device_gains(sdr, device_type, device_config, use_agc)
-        
-        log(f"Actual sample rate: {sdr.getSampleRate(SOAPY_SDR_RX, 0)} Hz")
-        log(f"Actual frequency: {sdr.getFrequency(SOAPY_SDR_RX, 0)/1e6} MHz")
-        
+    # Watchdog: if we go this many seconds without any valid samples,
+    # tear down and reinitialize the SDR device/stream.
+    WATCHDOG_SECONDS = 10.0
+
+    while True:
+        sdr = None
+        rx_stream = None
         try:
-            actual_gain = sdr.getGain(SOAPY_SDR_RX, 0)
-            log(f"Actual gain: {actual_gain} dB")
-        except:
-            pass
-        
-    except Exception as e:
-        log(f"ERROR: Could not configure device: {e}")
-        sys.exit(1)
-    
-    try:
-        rx_stream = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)
-        sdr.activateStream(rx_stream)
-    except Exception as e:
-        log(f"ERROR: Could not setup stream: {e}")
-        sys.exit(1)
-    
-    log("=" * 60)
-    
-    buff = np.zeros(4096, dtype=np.complex64)
-    
-    try:
-        while True:
-            sr = sdr.readStream(rx_stream, [buff], len(buff))
-            num_samples = sr.ret
+            try:
+                sdr = SoapySDR.Device(device_args)
+            except Exception as e:
+                log(f"ERROR: Could not open device: {e}")
+                log("Retrying in 5 seconds...")
+                time.sleep(5)
+                continue
             
-            if num_samples > 0:
-                iq_interleaved = np.empty(num_samples * 2, dtype=np.float32)
-                iq_interleaved[0::2] = buff[:num_samples].real
-                iq_interleaved[1::2] = buff[:num_samples].imag
-                sys.stdout.buffer.write(iq_interleaved.tobytes())
-                sys.stdout.buffer.flush()
-    
-    except KeyboardInterrupt:
-        log("\nStopping...")
-    
-    except Exception as e:
-        log(f"\nERROR: {e}")
-    
-    finally:
-        try:
-            sdr.deactivateStream(rx_stream)
-            sdr.closeStream(rx_stream)
-            log("Stream closed")
-        except:
-            pass
+            try:
+                sdr.setSampleRate(SOAPY_SDR_RX, 0, sample_rate)
+                sdr.setFrequency(SOAPY_SDR_RX, 0, frequency)
+                setup_device_gains(sdr, device_type, device_config, use_agc)
+                
+                log(f"Actual sample rate: {sdr.getSampleRate(SOAPY_SDR_RX, 0)} Hz")
+                log(f"Actual frequency: {sdr.getFrequency(SOAPY_SDR_RX, 0)/1e6} MHz")
+                
+                try:
+                    actual_gain = sdr.getGain(SOAPY_SDR_RX, 0)
+                    log(f"Actual gain: {actual_gain} dB")
+                except:
+                    pass
+                
+            except Exception as e:
+                log(f"ERROR: Could not configure device: {e}")
+                log("Retrying in 5 seconds...")
+                time.sleep(5)
+                continue
+            
+            try:
+                rx_stream = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)
+                sdr.activateStream(rx_stream)
+            except Exception as e:
+                log(f"ERROR: Could not setup stream: {e}")
+                log("Retrying in 5 seconds...")
+                time.sleep(5)
+                continue
+            
+            log("=" * 60)
+            
+            buff = np.zeros(4096, dtype=np.complex64)
+
+            bad_reads = 0
+            last_good = time.time()
+
+            while True:
+                sr = sdr.readStream(rx_stream, [buff], len(buff))
+                num_samples = sr.ret
+
+                if num_samples > 0:
+                    bad_reads = 0
+                    last_good = time.time()
+                    iq_interleaved = np.empty(num_samples * 2, dtype=np.float32)
+                    iq_interleaved[0::2] = buff[:num_samples].real
+                    iq_interleaved[1::2] = buff[:num_samples].imag
+                    sys.stdout.buffer.write(iq_interleaved.tobytes())
+                    sys.stdout.buffer.flush()
+                else:
+                    # 0 or negative: timeout/underflow or transient error.
+                    bad_reads += 1
+                    now = time.time()
+                    if bad_reads == 1 or bad_reads % 5000 == 0:
+                        log(f"WARNING: SoapySDR readStream returned {num_samples} (no samples) {bad_reads} times, flags={sr.flags}")
+                    # If we haven't seen any good samples for a while, reset SDR.
+                    if now - last_good > WATCHDOG_SECONDS:
+                        log(f"Watchdog: no valid IQ samples for {now - last_good:.1f}s, reinitializing SDR...")
+                        break
+                    time.sleep(0.01)
+
+        except KeyboardInterrupt:
+            log("\nStopping...")
+            break
+        except Exception as e:
+            log(f"\nERROR in streaming loop: {e}")
+            log("Restarting SDR in 5 seconds...")
+            time.sleep(5)
+        finally:
+            try:
+                if rx_stream is not None:
+                    sdr.deactivateStream(rx_stream)
+                    sdr.closeStream(rx_stream)
+                    log("Stream closed")
+            except Exception:
+                pass
 
 # ============================================================================
 # SECTION 2: Unified Launcher Functions
@@ -422,7 +471,9 @@ def start_pipeline(sdr_config, direwolf_config, direwolf_binary, use_web=False):
     except:
         pass
     
-    decimation = max(1, int(sample_rate / 24000))
+    # Target ~24 kHz Direwolf input by increasing decimation
+    target_output_rate = 24000
+    decimation = max(1, int(sample_rate / target_output_rate))
     output_rate = sample_rate // decimation
     
     print(f"Pipeline configuration:")
@@ -442,20 +493,42 @@ def start_pipeline(sdr_config, direwolf_config, direwolf_binary, use_web=False):
     
     csdr_cmd = ['csdr', 'fir_decimate_cc', str(decimation), '0.005', 'HAMMING']
     print(f"Starting decimation: {' '.join(csdr_cmd)}")
-    csdr_process = subprocess.Popen(csdr_cmd, stdin=sdr_process.stdout, 
+    csdr_process = subprocess.Popen(csdr_cmd, stdin=sdr_process.stdout,
                                      stdout=subprocess.PIPE, stderr=sys.stderr)
     sdr_process.stdout.close()
-    
+
+    # Optional Python FIR stage for web mode, controlled by web_interface
+    iq_process = None
+    prev_stdout = csdr_process.stdout
+
+    if use_web:
+        filter_mode = '24k'
+        try:
+            import web_interface  # type: ignore
+            m = web_interface.config.get('filter_quality', '24k')
+            if m in ('24k', '12k', '8k', '6k', '4k'):
+                filter_mode = m
+        except Exception as e:
+            print(f"Warning: could not read filter mode from web_interface: {e}")
+
+        iq_cmd = [sys.executable, str(script_dir / 'iq_lowpass.py'),
+                  '--rate', str(output_rate), '--mode', filter_mode]
+        print(f"Starting IQ FIR: {' '.join(iq_cmd)}")
+        iq_process = subprocess.Popen(iq_cmd, stdin=prev_stdout,
+                                      stdout=subprocess.PIPE, stderr=sys.stderr)
+        prev_stdout.close()
+        prev_stdout = iq_process.stdout
+
     if monitor_fifo:
         tee_cmd = ['tee', monitor_fifo]
         print(f"Starting tee: {' '.join(tee_cmd)}")
-        tee_process = subprocess.Popen(tee_cmd, stdin=csdr_process.stdout,
+        tee_process = subprocess.Popen(tee_cmd, stdin=prev_stdout,
                                         stdout=subprocess.PIPE, stderr=sys.stderr)
-        csdr_process.stdout.close()
+        prev_stdout.close()
         direwolf_stdin = tee_process.stdout
     else:
         tee_process = None
-        direwolf_stdin = csdr_process.stdout
+        direwolf_stdin = prev_stdout
     
     direwolf_cmd = [direwolf_binary, '-t', '0', '-r', str(output_rate), 
                     '-n', '1', f'iq:{output_rate}']
@@ -484,10 +557,18 @@ def start_pipeline(sdr_config, direwolf_config, direwolf_binary, use_web=False):
     
     if tee_process:
         direwolf_stdin.close()
-        return (sdr_process, csdr_process, tee_process, direwolf_process, monitor_fifo)
+        if iq_process is not None:
+            return (sdr_process, csdr_process, iq_process, tee_process, direwolf_process, monitor_fifo)
+        else:
+            return (sdr_process, csdr_process, tee_process, direwolf_process, monitor_fifo)
     else:
-        csdr_process.stdout.close()
-        return (sdr_process, csdr_process, None, direwolf_process, monitor_fifo)
+        # Non-web launcher mode (no FIFO/tee, no iq_process) keeps the original shape
+        if iq_process is not None:
+            prev_stdout.close()
+            return (sdr_process, csdr_process, iq_process, direwolf_process, monitor_fifo)
+        else:
+            csdr_process.stdout.close()
+            return (sdr_process, csdr_process, None, direwolf_process, monitor_fifo)
 
 def cleanup_pipeline(processes, monitor_fifo):
     """Clean up pipeline processes and FIFO"""
@@ -554,30 +635,36 @@ def run_web_interface(sdr_config_path, direwolf_config, direwolf_binary, pipelin
             sdr_config_path = new_sdr_config
 
             # Restart pipeline with freshly generated config
-            pipeline_result = start_pipeline(new_sdr_config, direwolf_config, 
-                                           direwolf_binary, use_web=True)
-            
-            if len(pipeline_result) == 5:
+            pipeline_result = start_pipeline(new_sdr_config, direwolf_config,
+                                            direwolf_binary, use_web=True)
+
+            # Normalize pipeline_result to include optional iq_process
+            iq_proc = None
+            if len(pipeline_result) == 6:
+                sdr_proc, csdr_proc, iq_proc, tee_proc, dw_proc, fifo = pipeline_result
+            elif len(pipeline_result) == 5:
+                # Backwards-compatible layout without explicit IQ FIR process
                 sdr_proc, csdr_proc, tee_proc, dw_proc, fifo = pipeline_result
-                processes = [p for p in [sdr_proc, csdr_proc, tee_proc, dw_proc] if p]
-                current_processes = {'processes': processes, 'fifo': fifo}
-                
-                # Update references
-                web_interface.pipeline_process = dw_proc
-                web_interface.pipeline_running = True
-                
-                # Restart reader thread
-                reader_thread = threading.Thread(
-                    target=web_interface.pipeline_reader, 
-                    args=(dw_proc,),
-                    daemon=True
-                )
-                reader_thread.start()
-                
-                print("Pipeline restarted successfully")
-                return {'success': True}
             else:
                 return {'success': False, 'error': 'Failed to start pipeline'}
+
+            processes = [p for p in [sdr_proc, csdr_proc, iq_proc, tee_proc, dw_proc] if p]
+            current_processes = {'processes': processes, 'fifo': fifo}
+
+            # Update references
+            web_interface.pipeline_process = dw_proc
+            web_interface.pipeline_running = True
+
+            # Restart reader thread
+            reader_thread = threading.Thread(
+                target=web_interface.pipeline_reader,
+                args=(dw_proc,),
+                daemon=True
+            )
+            reader_thread.start()
+
+            print("Pipeline restarted successfully")
+            return {'success': True}
                 
         except Exception as e:
             print(f"Error restarting pipeline: {e}")
@@ -633,51 +720,65 @@ def run_unified_launcher(args):
         print(f"ERROR: Direwolf config not found: {direwolf_config}")
         sys.exit(1)
     
-    pipeline_result = start_pipeline(sdr_config, direwolf_config, 
-                                      direwolf_binary, use_web=args.web)
-    
-    if args.web and len(pipeline_result) == 5:
-        sdr_proc, csdr_proc, tee_proc, dw_proc, fifo = pipeline_result
-        processes = [p for p in [sdr_proc, csdr_proc, tee_proc, dw_proc] if p]
-        
+    pipeline_result = start_pipeline(sdr_config, direwolf_config,
+                                     direwolf_binary, use_web=args.web)
+
+    # Web-enabled launcher: handle pipelines with or without explicit IQ FIR stage
+    if args.web:
+        if len(pipeline_result) == 6:
+            sdr_proc, csdr_proc, iq_proc, tee_proc, dw_proc, fifo = pipeline_result
+            processes = [p for p in [sdr_proc, csdr_proc, iq_proc, tee_proc, dw_proc] if p]
+        elif len(pipeline_result) == 5:
+            sdr_proc, csdr_proc, tee_proc, dw_proc, fifo = pipeline_result
+            processes = [p for p in [sdr_proc, csdr_proc, tee_proc, dw_proc] if p]
+        else:
+            print("ERROR: Unexpected pipeline layout from start_pipeline")
+            cleanup_pipeline([], None)
+            sys.exit(1)
+
         import web_interface
-        monitor_thread = threading.Thread(target=web_interface.continuous_rssi_monitor, 
+        monitor_thread = threading.Thread(target=web_interface.continuous_rssi_monitor,
                                           daemon=True)
         monitor_thread.start()
-        
+
         time.sleep(2)
-        
+
         def signal_handler(sig, frame):
             cleanup_pipeline(processes, fifo)
             sys.exit(0)
-        
+
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
-        
+
         try:
             run_web_interface(sdr_config, direwolf_config, direwolf_binary, processes, fifo)
         except KeyboardInterrupt:
             pass
         finally:
             cleanup_pipeline(processes, fifo)
-    
+
+    # Non-web unified launcher
     else:
-        if len(pipeline_result) == 5:
-            sdr_proc, csdr_proc, tee_proc, dw_proc, fifo = pipeline_result
-            processes = [p for p in [sdr_proc, csdr_proc, tee_proc, dw_proc] if p]
+        if len(pipeline_result) == 6:
+            sdr_proc, csdr_proc, iq_proc, tee_proc, dw_proc, fifo = pipeline_result
+            processes = [p for p in [sdr_proc, csdr_proc, iq_proc, tee_proc, dw_proc] if p]
+        elif len(pipeline_result) == 5:
+            sdr_proc, csdr_proc, third_proc, dw_proc, fifo = pipeline_result
+            processes = [p for p in [sdr_proc, csdr_proc, third_proc, dw_proc] if p]
         else:
-            sdr_proc, csdr_proc, tee_proc, dw_proc, fifo = (*pipeline_result, None, None, None)
-            processes = [p for p in [sdr_proc, csdr_proc, tee_proc, dw_proc] if p]
-        
+            print("ERROR: Unexpected pipeline layout from start_pipeline")
+            cleanup_pipeline([], None)
+            sys.exit(1)
+
         def signal_handler(sig, frame):
             cleanup_pipeline(processes, fifo)
             sys.exit(0)
-        
+
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
-        
+
         print("\nPipeline running. Press Ctrl+C to stop.")
-        
+
         try:
             dw_proc.wait()
         except KeyboardInterrupt:

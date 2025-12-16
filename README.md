@@ -100,6 +100,10 @@ It can also be used as a virtual TNC for other applications such as [APRSIS32](h
   
     A lightweight Flask-based web UI (branch `web_interface`) provides real-time RSSI/SNR charts and station statistics. Chart tooltips show Callsign, Via (Direct or last digipeater), and timestamp when hovering points. See `scripts/web_interface.py` and `scripts/templates/index.html`.
 
+- **SoapySDR IQ Pipeline Helper Scripts.**
+  
+    Helper Python scripts in `scripts/` (notably `soapysdr_to_direwolf.py`) provide a unified SoapySDR → `csdr` → Dire Wolf IQ pipeline with an optional web-based monitor. See `scripts/README.md` and `scripts/SOAPYSDR_TO_DIREWOLF.md`.
+
 - **Concurrent operation with up to 3 soundcards and 6 radios.**
 
 ### Portable & Open Source:
