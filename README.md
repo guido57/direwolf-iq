@@ -2,7 +2,7 @@
 
 ### Overview
 
-For a complete description of the original Direwolf please see its Readme [https://github.com/wb2osz/direwolf/blob/master/README.md](pippo)
+For a complete description of the original Direwolf please see its Readme [https://github.com/wb2osz/direwolf/blob/master/README.md](https://github.com/wb2osz/direwolf/blob/master/README.md)
 
 In the early days of Amateur Packet Radio, it was necessary to use an expensive "Terminal Node Controller" (TNC) with specialized hardware.  Those days are gone.  You can now get better results at lower cost by connecting your radio to the "soundcard" interface of a computer and using software to decode the signals.
 
