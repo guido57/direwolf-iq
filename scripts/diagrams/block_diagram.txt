@@ -1,0 +1,41 @@
+[BROWSER UI]
+  |
+  |  POST /api/pipeline/start /stop                               
+  v
+[Flask routes (server main thread)] 
+  |                                                              
+  |  
+  v                                                              
+[start_pipeline()/stop_pipeline()]                                
+  |                                                              
+  |  starts/stops subprocess pipeline + creates/removes FIFO      
+  v                                                              
+[subprocess pipeline: SDR → csdr] +→ [tee] → [direwolf] +
+                                  |                     |             
+                                  | IQ bytes (CF32)     | text lines  
+                                  v                     v             
+             [FIFO /tmp/direwolf_iq_monitor.fifo]  [direwolf stdout]
+                              |                         |
+                              |                         |
+                              v                         v
+     [continuous_rssi_monitor thread]               [pipeline_reader thread]
+       - reads FIFO (IQ CF32)                         - reads Direwolf stdout
+       - computes RSSI dBFS                           - parses packets/audio
+       - appends stats['continuous_rssi']             - appends stats['last_packets']
+       - emits Socket.IO continuous_rssi              - updates station stats
+                              |                       - emits Socket.IO new_packet + stats_update
+                              |                         |
+                              |                         |
+                              |                         |
+                              |Socket.IO                |Socket.IO 
+                              | - continuous_rssi       | - new_packet
+                              |                         | - stats_update  
+                              V                         V 
+[BROWSER UI]
+  - Socket.IO receives events "continuous_rssi"       - Socket.IO receives events "new_packet"           - HTTP GET /api/stats, 
+    and updates RSSI Monitor live                     - Socket.IO receives events "stats_update"           /api/stations, /api/packets   
+  - Fallback: if "Socket.IO continuous_rssi" stalls,                                                       (poll)   
+    HTTP GET /api/continuous_rssi to rebuild chart
+
+ 
+  

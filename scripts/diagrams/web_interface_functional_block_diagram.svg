@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1100" viewBox="0 0 1600 1100">
+  <defs>
+    <style>
+      .title { font: 700 22px sans-serif; fill: #111; }
+      .subtitle { font: 14px sans-serif; fill: #333; }
+      .laneTitle { font: 700 14px sans-serif; fill: #111; }
+      .boxTitle { font: 700 13px sans-serif; fill: #111; }
+      .boxText { font: 12px sans-serif; fill: #111; }
+      .small { font: 11px sans-serif; fill: #222; }
+      .muted { font: 11px sans-serif; fill: #555; }
+      .lane { fill: #fafafa; stroke: #cfcfcf; stroke-width: 1; }
+      .box { fill: #fff; stroke: #222; stroke-width: 1.2; rx: 10; ry: 10; }
+      .box2 { fill: #fff; stroke: #444; stroke-width: 1.2; rx: 10; ry: 10; }
+      .box3 { fill: #fff; stroke: #666; stroke-width: 1.2; rx: 10; ry: 10; }
+      .dashed { stroke-dasharray: 6 4; }
+      .arrow { stroke: #111; stroke-width: 1.4; fill: none; }
+      .arrowMuted { stroke: #666; stroke-width: 1.2; fill: none; }
+      .arrowBold { stroke: #111; stroke-width: 3.2; fill: none; }
+      .label { font: 12px sans-serif; fill: #111; }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,3 L0,6 z" fill="#111" />
+    </marker>
+    <marker id="arrowMuted" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,3 L0,6 z" fill="#666" />
+    </marker>
+  </defs>
+
+  <!-- Header -->
+  <text x="40" y="40" class="title">Direwolf-IQ: web_interface.py — Functional Block Diagram</text>
+  <text x="40" y="66" class="subtitle">Blocks include: every Flask app.route, Socket.IO events, threads, and pipeline pipes used for RSSI/packets.</text>
+
+  <!-- Swimlanes -->
+  <rect x="30" y="95" width="1540" height="245" class="lane"/>
+  <text x="45" y="120" class="laneTitle">Browser (scripts/templates/index.html)</text>
+
+  <rect x="30" y="350" width="1540" height="360" class="lane"/>
+  <text x="45" y="375" class="laneTitle">Flask + Socket.IO server (scripts/web_interface.py)</text>
+
+  <rect x="30" y="720" width="1540" height="345" class="lane"/>
+  <text x="45" y="745" class="laneTitle">External pipeline + FIFO (subprocess + named pipe)</text>
+
+  <!-- Browser blocks -->
+  <text x="60" y="132" class="muted">Browser main thread: HTTP polling</text>
+  <rect x="60" y="140" width="360" height="175" class="box"/>
+  <text x="80" y="165" class="boxTitle">UI Polling (HTTP)</text>
+  <text x="80" y="190" class="boxText">GET /api/stats (2s)</text>
+  <text x="80" y="210" class="boxText">GET /api/stations (5s)</text>
+  <text x="80" y="230" class="boxText">GET /api/packets (manual/initial)</text>
+  <text x="80" y="250" class="boxText">GET /api/config (initial)</text>
+  <text x="80" y="270" class="boxText">GET /api/preset/&lt;device&gt; (on device change)</text>
+
+  <text x="520" y="132" class="muted">Browser main thread: Socket.IO event handlers</text>
+  <rect x="520" y="140" width="430" height="175" class="box"/>
+  <text x="540" y="165" class="boxTitle">Socket.IO Client (WS)</text>
+  <text x="540" y="190" class="boxText">on new_packet → update packet log + markers</text>
+  <text x="540" y="210" class="boxText">on stats_update → update counters + status</text>
+  <text x="540" y="230" class="boxText">on continuous_rssi → push RSSI sample to chart</text>
+  <text x="540" y="252" class="boxText">Fallback: pollContinuousRssiFallback()</text>
+  <text x="540" y="272" class="small">(polls GET /api/continuous_rssi when WS stalls)</text>
+
+  <text x="1045" y="132" class="muted">Browser main thread: UI actions (POST start/stop)</text>
+  <rect x="1045" y="140" width="380" height="175" class="box"/>
+  <text x="1065" y="165" class="boxTitle">UI Actions (HTTP POST)</text>
+  <text x="1065" y="190" class="boxText">POST /api/config (apply settings)</text>
+  <text x="1065" y="210" class="boxText">POST /api/pipeline/start</text>
+  <text x="1065" y="230" class="boxText">POST /api/pipeline/stop</text>
+
+  <!-- Server: routes -->
+  <text x="60" y="392" class="muted">Server main thread: Flask route handlers</text>
+  <rect x="60" y="400" width="430" height="285" class="box2"/>
+  <text x="80" y="425" class="boxTitle">Flask Routes (@app.route)</text>
+  <text x="80" y="450" class="boxText">GET /  → render_template(index.html)</text>
+  <text x="80" y="470" class="boxText">GET /api/config</text>
+  <text x="80" y="490" class="boxText">POST /api/config  (may stop/start pipeline)</text>
+  <text x="80" y="510" class="boxText">GET /api/preset/&lt;device&gt;</text>
+  <text x="80" y="530" class="boxText">POST /api/pipeline/start</text>
+  <text x="80" y="550" class="boxText">POST /api/pipeline/stop</text>
+  <text x="80" y="570" class="boxText">GET /api/stats</text>
+  <text x="80" y="590" class="boxText">GET /api/packets</text>
+  <text x="80" y="610" class="boxText">GET /api/stations</text>
+  <text x="80" y="630" class="boxText">GET /api/metrics</text>
+  <text x="80" y="650" class="boxText">GET /api/continuous_rssi</text>
+
+  <!-- Server: Socket.IO main thread -->
+  <rect x="1050" y="400" width="430" height="175" class="box2"/>
+  <text x="1070" y="425" class="boxTitle">Server main thread: Socket.IO</text>
+  <text x="1070" y="450" class="boxText">@socketio.on('connect') → ensure RSSI monitor started</text>
+  <text x="1070" y="474" class="boxText">socketio.emit('continuous_rssi', {time,value})</text>
+  <text x="1070" y="500" class="boxText">Shared globals (used by routes + threads):</text>
+  <text x="1090" y="520" class="small">pipeline_running, pipeline_process, pipeline_lock</text>
+  <text x="1090" y="540" class="small">stats (deques: last_packets, continuous_rssi, rssi_history, snr_history)</text>
+  <text x="1090" y="560" class="small">config (device, freq, sample_rate, gains, filter_quality)</text>
+
+  <!-- Server: packet parser background thread -->
+  <rect x="1050" y="585" width="430" height="100" class="box2"/>
+  <text x="1070" y="610" class="boxTitle">Background thread: packet parser (pipeline_reader)</text>
+  <text x="1070" y="635" class="boxText">Reads Direwolf stdout → parse packets + audio level</text>
+  <text x="1070" y="655" class="boxText">Updates stats['last_packets'] and station list</text>
+  <text x="1070" y="675" class="boxText">Emits: new_packet, stats_update</text>
+
+  <!-- External pipeline -->
+  <text x="60" y="772" class="muted">Subprocesses: SDR → CSDR → tee → Direwolf (no Python thread)</text>
+  <rect x="60" y="780" width="340" height="210" class="box3"/>
+  <text x="80" y="805" class="boxTitle">Pipeline (start_pipeline)</text>
+  <text x="80" y="830" class="boxText">bash -c full_cmd:</text>
+  <text x="100" y="855" class="small">python3 …/soapysdr_to_direwolf.py --config …</text>
+  <text x="100" y="875" class="small">| csdr fir_decimate_cc &lt;decimation&gt; …</text>
+  <text x="100" y="895" class="small">| tee /tmp/direwolf_iq_monitor.fifo</text>
+  <text x="100" y="915" class="small">| direwolf … -r &lt;rate&gt; … iq:&lt;rate&gt;</text>
+  <text x="80" y="945" class="muted">Note: direwolf output is read by pipeline_reader().</text>
+
+  <text x="750" y="772" class="muted">Background thread: RSSI monitor (continuous_rssi_monitor)</text>
+  <rect x="750" y="780" width="640" height="250" class="box3"/>
+  <text x="770" y="805" class="boxTitle">Named Pipe / FIFO</text>
+  <text x="770" y="830" class="boxText">/tmp/direwolf_iq_monitor.fifo</text>
+  <text x="770" y="854" class="small">Writer: tee (in pipeline)</text>
+  <text x="770" y="874" class="small">Readers:</text>
+  <text x="790" y="894" class="small">- keepalive_fd (nonblocking, prevents writer EPIPE)</text>
+  <text x="790" y="914" class="small">- fifo reader (blocking), reads CF32 IQ for RSSI dBFS</text>
+  <text x="770" y="940" class="muted">continuous_rssi_monitor reopens FIFO if removed/recreated.</text>
+
+  <!-- Arrows: Browser to server routes (connect edge-to-edge) -->
+  <!-- UI Polling box: x=60..490, y=140..315  -> Routes box: x=60..520, y=400..685 -->
+  <path d="M240 315 L275 400" class="arrow" marker-end="url(#arrow)"/>
+  <text x="175" y="350" class="label">HTTP GETs</text>
+
+  <!-- UI Actions box: x=1045..1530, y=140..315 -> Routes box top edge -->
+  <path d="M1235 315 L400 400" class="arrow" marker-end="url(#arrow)"/>
+  <text x="1205" y="350" class="label">HTTP POSTs</text>
+
+  <!-- Arrows: Socket.IO (client box -> socket server box) -->
+  <!-- Client box: x=520..1020,y=140..315 -> SocketIO box: x=1050..1530,y=400..685 -->
+  <path d="M735 315 L1265 400" class="arrow" marker-end="url(#arrow)"/>
+  <text x="860" y="350" class="label">WebSocket (Socket.IO)</text>
+
+  <!-- Arrows: Server to external pipeline (routes box bottom -> pipeline box top) -->
+  <!-- Routes box: x=60..490,y=400..685 -> Pipeline box: x=60..400,y=780..990 -->
+  <path d="M275 685 L230 780" class="arrow" marker-end="url(#arrow)"/>
+  <text x="265" y="740" class="label">start_pipeline()</text>
+
+  <!-- Arrows: Direwolf stdout (pipeline -> packet parser thread) -->
+  <path d="M330 780 L1265 685" class="arrowMuted" marker-end="url(#arrowMuted)"/>
+  <text x="585" y="715" class="label">Direwolf stdout → packet parser (pipeline_reader)</text>
+
+  <!-- Arrows: tee to FIFO (pipeline box right edge -> FIFO box left edge) -->
+  <!-- Pipeline box right edge: x=400 ; FIFO box left edge: x=750 -->
+  <path d="M400 905 L750 905" class="arrowBold" marker-end="url(#arrow)"/>
+    <text x="575" y="890" class="label" text-anchor="middle">IQ bytes (CF32) written by tee → FIFO</text>
+
+  <!-- Arrows: FIFO read (FIFO -> continuous_rssi_monitor thread -> emits continuous_rssi) -->
+  <path d="M1070 780 L1170 685" class="arrowBold" marker-end="url(#arrow)"/>
+  <text x="980" y="795" class="label">FIFO read (blocking) → RSSI compute</text>
+
+  <!-- Arrows: emit continuous_rssi (SocketIO box left edge -> client box right edge) -->
+  <!-- SocketIO box left edge: x=1050 ; client box right edge: x=950 -->
+  <path d="M1050 505 L950 505" class="arrow" marker-end="url(#arrow)"/>
+  <text x="990" y="490" class="label">emit continuous_rssi</text>
+
+  <!-- Footer -->
+  <text x="40" y="1085" class="muted">Editable in LibreOffice Draw: open this SVG file, then modify shapes/connectors.</text>
+</svg>

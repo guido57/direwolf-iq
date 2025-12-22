@@ -363,6 +363,7 @@ def run_direct_streaming(config_data, device_type, device_args, use_agc):
 
             bad_reads = 0
             last_good = time.time()
+            downstream_closed = False
 
             while True:
                 sr = sdr.readStream(rx_stream, [buff], len(buff))
@@ -374,8 +375,16 @@ def run_direct_streaming(config_data, device_type, device_args, use_agc):
                     iq_interleaved = np.empty(num_samples * 2, dtype=np.float32)
                     iq_interleaved[0::2] = buff[:num_samples].real
                     iq_interleaved[1::2] = buff[:num_samples].imag
-                    sys.stdout.buffer.write(iq_interleaved.tobytes())
-                    sys.stdout.buffer.flush()
+                    try:
+                        sys.stdout.buffer.write(iq_interleaved.tobytes())
+                        sys.stdout.buffer.flush()
+                    except BrokenPipeError:
+                        # Downstream (csdr/tee/direwolf) exited. Don't keep
+                        # reinitializing the SDR endlessly: exit cleanly so the
+                        # launcher/supervisor can restart the full pipeline.
+                        log("\nERROR in streaming loop: [Errno 32] Broken pipe")
+                        downstream_closed = True
+                        break
                 else:
                     # 0 or negative: timeout/underflow or transient error.
                     bad_reads += 1
@@ -387,6 +396,9 @@ def run_direct_streaming(config_data, device_type, device_args, use_agc):
                         log(f"Watchdog: no valid IQ samples for {now - last_good:.1f}s, reinitializing SDR...")
                         break
                     time.sleep(0.01)
+
+            if downstream_closed:
+                break
 
         except KeyboardInterrupt:
             log("\nStopping...")
@@ -403,6 +415,10 @@ def run_direct_streaming(config_data, device_type, device_args, use_agc):
                     log("Stream closed")
             except Exception:
                 pass
+
+        if downstream_closed:
+            # Exit outer re-init loop too.
+            break
 
 # ============================================================================
 # SECTION 2: Unified Launcher Functions
@@ -616,18 +632,30 @@ def run_web_interface(sdr_config_path, direwolf_config, direwolf_binary, pipelin
     
     # Store references to processes in the closure
     current_processes = {'processes': pipeline_processes, 'fifo': monitor_fifo}
+    restart_lock = threading.Lock()
+    restarting = {'active': False}
     
     def custom_start():
         """Restart pipeline with updated config from web interface"""
         nonlocal current_processes, sdr_config_path
         
         print("Restarting pipeline with new configuration...")
+
+        # Prevent concurrent restarts (watchdog + user action).
+        with restart_lock:
+            if restarting['active']:
+                return {'success': False, 'error': 'Restart already in progress'}
+            restarting['active'] = True
         
         # Stop current pipeline
-        cleanup_pipeline(current_processes['processes'], current_processes['fifo'])
-        web_interface.pipeline_running = False
-        # Wait for RSSI monitor to detect FIFO removal and close it
-        time.sleep(2)
+        try:
+            cleanup_pipeline(current_processes['processes'], current_processes['fifo'])
+            web_interface.pipeline_running = False
+            # Wait for RSSI monitor to detect FIFO removal and close it
+            time.sleep(2)
+        finally:
+            # Keep the "restarting" flag set until we've completed restart attempt
+            pass
         
         try:
             # Regenerate SoapySDR config from current web settings
@@ -671,14 +699,67 @@ def run_web_interface(sdr_config_path, direwolf_config, direwolf_binary, pipelin
             import traceback
             traceback.print_exc()
             return {'success': False, 'error': str(e)}
+        finally:
+            with restart_lock:
+                restarting['active'] = False
     
     def custom_stop():
-        cleanup_pipeline(current_processes['processes'], current_processes['fifo'])
-        web_interface.pipeline_running = False
+        nonlocal current_processes
+        with restart_lock:
+            restarting['active'] = True
+        try:
+            cleanup_pipeline(current_processes['processes'], current_processes['fifo'])
+            current_processes = {'processes': [], 'fifo': None}
+            web_interface.pipeline_running = False
+        finally:
+            with restart_lock:
+                restarting['active'] = False
         return {'success': True}
     
     web_interface.start_pipeline = custom_start
     web_interface.stop_pipeline = custom_stop
+
+    def pipeline_watchdog():
+        """Restart pipeline if any subprocess exits unexpectedly."""
+        while True:
+            try:
+                if not web_interface.pipeline_running:
+                    time.sleep(1.0)
+                    continue
+
+                procs = current_processes.get('processes') or []
+                if not procs:
+                    time.sleep(1.0)
+                    continue
+
+                dead = []
+                for p in procs:
+                    try:
+                        rc = p.poll()
+                    except Exception:
+                        rc = None
+                    if rc is not None:
+                        dead.append((p, rc))
+
+                if dead:
+                    # Mark stopped and restart.
+                    print("\nPipeline watchdog: detected exited subprocess(es):")
+                    for _, rc in dead:
+                        print(f"  returncode={rc}")
+                    print("Pipeline watchdog: restarting full pipeline...")
+
+                    web_interface.pipeline_running = False
+                    # Reuse the same restart path the UI uses.
+                    res = custom_start()
+                    if not res.get('success'):
+                        print(f"Pipeline watchdog: restart failed: {res.get('error')}")
+                        time.sleep(5)
+            except Exception as e:
+                print(f"Pipeline watchdog: error: {e}")
+                time.sleep(5)
+
+    watchdog_thread = threading.Thread(target=pipeline_watchdog, daemon=True)
+    watchdog_thread.start()
     
     import logging
     logging.getLogger('werkzeug').setLevel(logging.ERROR)
@@ -737,9 +818,14 @@ def run_unified_launcher(args):
             sys.exit(1)
 
         import web_interface
-        monitor_thread = threading.Thread(target=web_interface.continuous_rssi_monitor,
-                                          daemon=True)
-        monitor_thread.start()
+        # Ensure RSSI monitor is started once (avoid multiple threads).
+        try:
+            web_interface.ensure_continuous_rssi_monitor_started()
+        except Exception:
+            # Backward compatibility if function isn't available.
+            monitor_thread = threading.Thread(target=web_interface.continuous_rssi_monitor,
+                                              daemon=True)
+            monitor_thread.start()
 
         time.sleep(2)
 

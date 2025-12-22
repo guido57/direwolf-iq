@@ -17,6 +17,7 @@ import json
 import time
 import os
 import logging
+import sys
 from datetime import datetime
 from collections import defaultdict, deque
 
@@ -38,6 +39,12 @@ if not logger.handlers:
 pipeline_process = None
 pipeline_running = False
 pipeline_lock = threading.Lock()
+
+# Background monitor thread state. When this module is imported by a WSGI/Flask
+# runner (e.g., `flask run`, gunicorn), the `__main__` block won't execute.
+# Start the RSSI monitor lazily on first use so the UI keeps working.
+_monitor_thread = None
+_monitor_lock = threading.Lock()
 
 # Configuration
 # Now uses SoapySDR config files for multi-device support
@@ -371,6 +378,25 @@ def pipeline_reader(process):
         except Exception:
             logger.exception("pipeline_reader: error while processing line")
 
+    # If the pipeline process ended, reflect that in state.
+    try:
+        rc = process.poll()
+    except Exception:
+        rc = None
+
+    if rc is not None:
+        logger.warning(f"pipeline_reader: pipeline process exited with code {rc}")
+        with pipeline_lock:
+            # Only flip the flag if nothing else already stopped it.
+            global pipeline_running, pipeline_process
+            if pipeline_process is process:
+                pipeline_process = None
+            pipeline_running = False
+        try:
+            socketio.emit('stats_update', get_stats())
+        except Exception:
+            logger.exception("pipeline_reader: error emitting final stats_update")
+
     logger.info("pipeline_reader: stopped")
 
 # Signal power monitoring using tee to tap the pipeline
@@ -382,6 +408,12 @@ def continuous_rssi_monitor():
     import struct
     
     monitor_fifo = '/tmp/direwolf_iq_monitor.fifo'
+
+    # Rate-limit noisy diagnostics but keep enough breadcrumbs to understand
+    # FIFO writer/reader behavior over long runtimes.
+    last_diag = 0.0
+    bytes_total = 0
+    last_open_log = 0.0
     
     keepalive_fd = None
     while True:
@@ -398,6 +430,10 @@ def continuous_rssi_monitor():
                     try:
                         keepalive_fd = os.open(monitor_fifo, os.O_RDONLY | os.O_NONBLOCK)
                         # Do not read from keepalive_fd; it's only to prevent writer EPIPE
+                        now = time.time()
+                        if now - last_open_log > 5:
+                            logger.info(f"RSSI monitor: keepalive reader opened on FIFO {monitor_fifo}")
+                            last_open_log = now
                     except Exception as e:
                         # Only report actual errors
                         logger.warning(f"RSSI monitor: keepalive open failed: {e}")
@@ -416,6 +452,11 @@ def continuous_rssi_monitor():
                     fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
                     # Convert to regular file object
                     fifo = os.fdopen(fd, 'rb')
+
+                    now = time.time()
+                    if now - last_open_log > 5:
+                        logger.info(f"RSSI monitor: FIFO reader opened (blocking) on {monitor_fifo}")
+                        last_open_log = now
 
                     # Buffer reads to avoid spurious EOF/incomplete chunks
                     buf = bytearray()
@@ -438,7 +479,12 @@ def continuous_rssi_monitor():
                                 continue
                             if len(data) == 0:
                                 # True EOF – likely pipeline restart; reopen outer loop
+                                now = time.time()
+                                if now - last_diag > 1:
+                                    logger.info("RSSI monitor: FIFO EOF (writer likely restarted), reopening")
+                                    last_diag = now
                                 break
+                            bytes_total += len(data)
                             buf.extend(data)
 
                         if len(buf) < chunk_size:
@@ -475,6 +521,15 @@ def continuous_rssi_monitor():
                             })
                         except Exception:
                             logger.exception("RSSI monitor: error emitting continuous_rssi")
+
+                        # Periodic diagnostic to prove data is flowing end-to-end
+                        now = time.time()
+                        if now - last_diag > 30:
+                            logger.info(
+                                "RSSI monitor: flowing IQ via FIFO "
+                                f"(rate~{output_rate}Hz, chunk={chunk_size}B/100ms, bytes_total={bytes_total}, last_rssi={rssi_dbfs:.1f} dBFS)"
+                            )
+                            last_diag = now
                 finally:
                     if fifo is not None:
                         try:
@@ -498,6 +553,20 @@ def continuous_rssi_monitor():
                     pass
                 keepalive_fd = None
             time.sleep(0.5)
+
+def ensure_continuous_rssi_monitor_started():
+    """Start the continuous RSSI monitor thread once.
+
+    This must not rely on the `__main__` block because many deployment modes
+    import this module without executing it.
+    """
+    global _monitor_thread
+    with _monitor_lock:
+        if _monitor_thread is not None and _monitor_thread.is_alive():
+            return
+        _monitor_thread = threading.Thread(target=continuous_rssi_monitor, daemon=True)
+        _monitor_thread.start()
+        logger.info("RSSI monitor: background thread started")
 
 def start_pipeline():
     """Start the SDR→direwolf pipeline with IQ tapping for continuous RSSI."""
@@ -526,8 +595,10 @@ def start_pipeline():
                     os.remove(monitor_fifo)
                 os.mkfifo(monitor_fifo)
                 print(f"Created monitoring FIFO: {monitor_fifo}")
+                logger.info(f"Pipeline: created monitoring FIFO {monitor_fifo}")
             except Exception as e:
                 print(f"Warning: couldn't create FIFO: {e}")
+                logger.warning(f"Pipeline: couldn't create monitoring FIFO {monitor_fifo}: {e}")
             
             # Generate SoapySDR config file
             sdr_config = generate_soapysdr_config()
@@ -618,8 +689,10 @@ def stop_pipeline():
                 if os.path.exists(monitor_fifo):
                     os.remove(monitor_fifo)
                     print(f"Removed monitoring FIFO: {monitor_fifo}")
+                    logger.info(f"Pipeline: removed monitoring FIFO {monitor_fifo}")
             except Exception as e:
                 print(f"Warning: couldn't remove FIFO: {e}")
+                logger.warning(f"Pipeline: couldn't remove monitoring FIFO {monitor_fifo}: {e}")
             
             print("Pipeline stopped successfully")
             return {'success': True}
@@ -823,11 +896,18 @@ def load_preset(device):
 
 @app.route('/api/pipeline/start', methods=['POST'])
 def api_start_pipeline():
+    ensure_continuous_rssi_monitor_started()
     return jsonify(start_pipeline())
 
 @app.route('/api/pipeline/stop', methods=['POST'])
 def api_stop_pipeline():
     return jsonify(stop_pipeline())
+
+@socketio.on('connect')
+def _on_socket_connect():
+    # If the UI is using Socket.IO, ensure the monitor is running so the
+    # `continuous_rssi` stream is produced.
+    ensure_continuous_rssi_monitor_started()
 
 @app.route('/api/stats', methods=['GET'])
 def api_get_stats():
@@ -873,6 +953,42 @@ def api_get_metrics():
         'snr': list(stats['snr_history'])
     })
 
+@app.route('/api/continuous_rssi', methods=['GET'])
+def api_get_continuous_rssi():
+    # Keep payload bounded by the deque maxlen (60 seconds @ 100ms).
+    return jsonify(list(stats['continuous_rssi']))
+
+
+@app.route('/api/versions', methods=['GET'])
+def api_get_versions():
+    """Report runtime versions for Socket.IO troubleshooting.
+
+    This must reflect the *running server* environment (sys.executable), which
+    may differ from an interactive shell on the same host.
+    """
+
+    def _pkg_version(dist_name: str):
+        try:
+            import importlib.metadata as md  # Python 3.8+
+            return md.version(dist_name)
+        except Exception:
+            try:
+                import pkg_resources as pr
+                return pr.get_distribution(dist_name).version
+            except Exception:
+                return None
+
+    return jsonify({
+        'python': sys.version,
+        'executable': sys.executable,
+        'packages': {
+            'flask': _pkg_version('flask'),
+            'flask-socketio': _pkg_version('flask-socketio'),
+            'python-socketio': _pkg_version('python-socketio'),
+            'python-engineio': _pkg_version('python-engineio'),
+        }
+    })
+
 if __name__ == '__main__':
     import logging
     # Disable Flask request logging completely
@@ -885,8 +1001,7 @@ if __name__ == '__main__':
     logging.getLogger('engineio').setLevel(logging.ERROR)
     
     # Start continuous RSSI monitoring thread
-    monitor_thread = threading.Thread(target=continuous_rssi_monitor, daemon=True)
-    monitor_thread.start()
+    ensure_continuous_rssi_monitor_started()
     
     print("Starting Direwolf Web Interface...")
     print("Open http://localhost:5000 in your browser")

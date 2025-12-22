@@ -4,7 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Direwolf SDR Monitor</title>
-    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <!-- Raspberry Pi runs Flask-SocketIO 5.x / python-engineio 4.x, so the browser needs Socket.IO v4 (EIO=4). -->
+    <script src="https://cdn.jsdelivr.net/npm/socket.io-client@4.7.5/dist/socket.io.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -304,8 +305,129 @@
     </div>
     
     <script>
-        const socket = io();
+        // Prefix-aware URLs for reverse-proxy deployments (e.g. /iw5alz-12/).
+        // Caddy `handle_path /prefix*` strips the prefix before proxying, so the
+        // browser must include the prefix on every /api/* and /socket.io/* request.
+        function computeBasePath() {
+            const p = (window.location && window.location.pathname) ? window.location.pathname : '/';
+            if (!p || p === '/') return '/';
+            if (p.endsWith('/')) return p;
+            // Single-segment path like "/iw5alz-12" should behave like a directory.
+            if (/^\/[^\/]+$/.test(p)) return p + '/';
+
+            const lastSlash = p.lastIndexOf('/');
+            const lastSegment = p.slice(lastSlash + 1);
+            // If it looks like a file name, use its directory; otherwise treat as directory.
+            if (lastSegment.includes('.')) return p.slice(0, lastSlash + 1);
+            return p + '/';
+        }
+
+        const BASE_PATH = computeBasePath();
+        const QS = new URLSearchParams(window.location.search || '');
+        const DEBUG = QS.has('debug') || QS.get('debug') === '1' || QS.get('debug') === 'true';
+
+        // Always-on stamp to confirm which frontend build is running (useful on mobile/proxies with caching).
+        const DW_UI_BUILD = '2025-12-21a';
+        try {
+            console.info('[dw-ui]', DW_UI_BUILD, 'debug=', DEBUG, 'path=', (window.location && window.location.pathname));
+        } catch (_) {
+            // ignore
+        }
+
+        function dbg(...args) {
+            if (!DEBUG) return;
+            try {
+                console.info('[dw-debug]', ...args);
+            } catch (_) {
+                // ignore
+            }
+        }
+        function apiUrl(path) {
+            const rel = String(path || '').replace(/^\/+/, '');
+            return BASE_PATH + rel;
+        }
+
+        function apiFetch(path, options) {
+            const url = apiUrl(path);
+            const opts = Object.assign({ cache: 'no-store' }, options || {});
+            return fetch(url, opts);
+        }
+
+        function toEpochMs(value) {
+            if (value === null || value === undefined) return NaN;
+            if (value instanceof Date) return value.getTime();
+            if (typeof value === 'number') {
+                // Heuristic: seconds vs milliseconds.
+                return value < 1e12 ? value * 1000 : value;
+            }
+            const t = Date.parse(String(value));
+            return Number.isFinite(t) ? t : NaN;
+        }
+
+        const SOCKETIO_PATH = BASE_PATH.replace(/\/$/, '') + '/socket.io';
+        // Socket.IO is best-effort here: the UI also polls /api/* so it works even if
+        // the realtime channel is unavailable or blocked by proxies.
+        const socket = io({
+            path: SOCKETIO_PATH,
+            transports: ['polling'],
+            upgrade: false,
+            reconnection: true,
+            reconnectionAttempts: 10,
+            reconnectionDelay: 1000,
+            reconnectionDelayMax: 5000,
+            timeout: 5000
+        });
+
+        dbg('BASE_PATH =', BASE_PATH);
+        dbg('SOCKETIO_PATH =', SOCKETIO_PATH);
+        dbg('Socket.IO client io.protocol =', (typeof io !== 'undefined' ? io.protocol : 'undefined'));
+
+        let lastNewPacketAt = 0;
+        let lastStatsAt = 0;
+        let lastPacketsPollAt = 0;
+        let connectErrorCount = 0;
+        let firstConnectErrorAt = 0;
+
+        socket.on('connect', () => {
+            connectErrorCount = 0;
+            firstConnectErrorAt = 0;
+            dbg('socket connect; id =', socket.id);
+            try {
+                const t = socket.io && socket.io.engine && socket.io.engine.transport ? socket.io.engine.transport.name : 'unknown';
+                dbg('engine transport =', t);
+            } catch (_) {
+                // ignore
+            }
+        });
+
+        socket.on('disconnect', (reason) => {
+            dbg('socket disconnect; reason =', reason);
+        });
+
+        socket.on('connect_error', (err) => {
+            // Helpful when reverse proxies or protocol mismatches break Socket.IO.
+            connectErrorCount += 1;
+            if (!firstConnectErrorAt) firstConnectErrorAt = Date.now();
+
+            let msg = '';
+            try { msg = (err && err.message) ? err.message : String(err); } catch (_) { msg = 'unknown'; }
+            dbg('socket connect_error:', msg, '(count', connectErrorCount + ')');
+
+            // If we get stuck in a tight connect_error loop, stop trying and rely on polling.
+            const windowMs = 30000;
+            if (firstConnectErrorAt && (Date.now() - firstConnectErrorAt) < windowMs && connectErrorCount >= 5) {
+                try {
+                    dbg('too many connect_error; disabling socket reconnect and falling back to polling only');
+                    socket.io.opts.reconnection = false;
+                    socket.close();
+                } catch (_) {
+                    // ignore
+                }
+            }
+        });
         let continuousRssiChart;
+        let lastContinuousRssiAt = 0;
+        let lastPacketsCache = [];
         // Station list state for client-side sorting
         let stationData = [];
         let stationSortKey = 'callsign';
@@ -482,7 +604,7 @@
                                 } else {
                                     const tsArr = ctx.dataset._timestamps || [];
                                     const ts = tsArr[ctx.dataIndex];
-                                    const tStr = ts ? new Date(ts).toLocaleTimeString() : '';
+                                    const tStr = (typeof ts === 'number' && isFinite(ts)) ? new Date(ts).toLocaleTimeString() : '';
                                     const rssiStr = `RSSI: ${ctx.parsed.y.toFixed(1)} dBFS`;
                                     return tStr ? `${rssiStr}  •  ${tStr}` : rssiStr;
                                 }
@@ -514,6 +636,7 @@
 
         // Socket events
         socket.on('new_packet', (packet) => {
+            lastNewPacketAt = Date.now();
             addPacketToLog(packet);
             if (packet.rssi !== undefined && packet.rssi !== null) {
                 // Add marker on the continuous RSSI chart at peak position
@@ -523,11 +646,12 @@
         
         socket.on('continuous_rssi', (data) => {
             // Add continuous RSSI sample (100ms interval)
+            lastContinuousRssiAt = Date.now();
             const ds = continuousRssiChart.data.datasets[0];     // line dataset
             const pkt = continuousRssiChart.data.datasets[1];     // packet markers
             continuousRssiChart.data.labels.push('');
             ds.data.push(data.value);
-            ds._timestamps.push(data.time);
+            ds._timestamps.push(toEpochMs(data.time));
             // keep overlay arrays aligned
             pkt.data.push(NaN);
             pkt._packetInfo.push(null);
@@ -543,22 +667,70 @@
             continuousRssiChart.update('none');
         });
 
+        async function pollContinuousRssiFallback() {
+            // If Socket.IO has been quiet for a while, fall back to HTTP.
+            // This keeps RSSI updating even if the websocket silently drops.
+            if (Date.now() - lastContinuousRssiAt < 2000) return;
+            try {
+                const resp = await apiFetch('api/continuous_rssi');
+                if (!resp.ok) return;
+                const samples = await resp.json();
+                if (!Array.isArray(samples) || samples.length === 0) return;
+
+                const ds = continuousRssiChart.data.datasets[0];
+                const pkt = continuousRssiChart.data.datasets[1];
+
+                // Rebuild the line series from server state.
+                continuousRssiChart.data.labels = new Array(samples.length).fill('');
+                ds.data = samples.map(s => s.value);
+                ds._timestamps = samples.map(s => toEpochMs(s.time));
+
+                // Keep packet overlay arrays aligned; markers will be added again
+                // for new packets as they arrive.
+                pkt.data = new Array(samples.length).fill(NaN);
+                pkt._packetInfo = new Array(samples.length).fill(null);
+
+                // If Socket.IO is down, RSSI is rebuilt frequently via HTTP. Re-apply
+                // packet markers immediately from the most recent polled packets to
+                // avoid visible blinking.
+                if (Array.isArray(lastPacketsCache) && lastPacketsCache.length > 0) {
+                    rebuildPacketMarkersFromPackets(lastPacketsCache);
+                }
+
+                continuousRssiChart.update('none');
+            } catch (e) {
+                // Ignore transient network errors.
+            }
+        }
+
+        socket.on('connect_error', (err) => {
+            // Helpful when reverse proxies or protocol mismatches break Socket.IO.
+            // Close to prevent repeated polling attempts from spamming the console.
+            try {
+                const msg = err && err.message ? err.message : String(err);
+                console.warn('Socket.IO connect_error:', msg);
+            } catch (_) {
+                // ignore
+            }
+            try { socket.close(); } catch (_) { /* ignore */ }
+        });
+
         // Map packet events to peak RSSI in window around packet timestamp
-        function addPacketMarkerToRssiChart(packet) {
+        function addPacketMarkerToRssiChart(packet, skipUpdate) {
             const ds = continuousRssiChart.data.datasets[0];
             const pkt = continuousRssiChart.data.datasets[1];
             if (!ds._timestamps || ds._timestamps.length === 0) return;
             if (packet.rssi === undefined || packet.rssi === null) return;
             
-            const tsTarget = Date.parse(packet.timestamp);
-            if (isNaN(tsTarget)) return;
+            const tsTarget = toEpochMs(packet.timestamp);
+            if (!Number.isFinite(tsTarget)) return;
             
             // Find the closest timestamp index
             let centerIdx = -1;
             let bestDelta = Infinity;
             for (let i = 0; i < ds._timestamps.length; i++) {
-                const t = Date.parse(ds._timestamps[i]);
-                if (isNaN(t)) continue;
+                const t = ds._timestamps[i];
+                if (!Number.isFinite(t)) continue;
                 const d = Math.abs(t - tsTarget);
                 if (d < bestDelta) {
                     bestDelta = d;
@@ -592,11 +764,44 @@
                 via,
                 timeStr: packet.timestamp ? new Date(packet.timestamp).toLocaleTimeString() : '-'
             };
-            
-            continuousRssiChart.update('none');
+
+            if (!skipUpdate) {
+                continuousRssiChart.update('none');
+            }
+        }
+
+        function rebuildPacketMarkersFromPackets(packets) {
+            try {
+                if (!continuousRssiChart || !continuousRssiChart.data) return;
+                const ds = continuousRssiChart.data.datasets[0];
+                const pkt = continuousRssiChart.data.datasets[1];
+                if (!ds || !pkt) return;
+                if (!ds._timestamps || ds._timestamps.length === 0) return;
+
+                const n = continuousRssiChart.data.labels.length;
+                pkt.data = new Array(n).fill(NaN);
+                pkt._packetInfo = new Array(n).fill(null);
+
+                if (!Array.isArray(packets) || packets.length === 0) {
+                    continuousRssiChart.update('none');
+                    return;
+                }
+
+                // Avoid heavy redraw on slow devices; only re-apply markers for recent packets.
+                const recent = packets.slice(Math.max(0, packets.length - 50));
+                for (const p of recent) {
+                    if (p && p.rssi !== undefined && p.rssi !== null) {
+                        addPacketMarkerToRssiChart(p, true);
+                    }
+                }
+                continuousRssiChart.update('none');
+            } catch (e) {
+                // Don't let marker rebuild break periodic updates.
+            }
         }
         
         socket.on('stats_update', (stats) => {
+            lastStatsAt = Date.now();
             document.getElementById('packetsReceived').textContent = stats.packets_received;
             document.getElementById('stationsHeard').textContent = stats.stations_heard;
             document.getElementById('directSenders').textContent = stats.direct_rf_senders;
@@ -655,7 +860,7 @@
         }
 
         async function pushConfig(config) {
-            const response = await fetch('/api/config', {
+            const response = await apiFetch('api/config', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(config)
@@ -671,13 +876,13 @@
                 alert('Failed to apply settings: ' + cfgResp.error);
                 return;
             }
-            const response = await fetch('/api/pipeline/start', { method: 'POST' });
+            const response = await apiFetch('api/pipeline/start', { method: 'POST' });
             const data = await response.json();
             if (!data.success) alert('Failed to start: ' + data.error);
         }
 
         async function stopPipeline() {
-            const response = await fetch('/api/pipeline/stop', { method: 'POST' });
+            const response = await apiFetch('api/pipeline/stop', { method: 'POST' });
             const data = await response.json();
             if (!data.success) alert('Failed to stop: ' + data.error);
         }
@@ -804,16 +1009,22 @@
         }
         
         async function loadStations() {
-            const response = await fetch('/api/stations');
-            const stations = await response.json();
-            stationData = Array.isArray(stations) ? stations : [];
-            renderStations();
+            try {
+                const response = await apiFetch('api/stations');
+                const stations = await response.json();
+                stationData = Array.isArray(stations) ? stations : [];
+                renderStations();
+            } catch (e) {
+                // Ignore transient network errors.
+            }
         }
         
         async function loadPackets() {
             try {
-                const response = await fetch('/api/packets');
+                const response = await apiFetch('api/packets');
                 const packets = await response.json();
+                lastPacketsCache = Array.isArray(packets) ? packets : [];
+                lastPacketsPollAt = Date.now();
                 const log = document.getElementById('packetLog');
                 
                 if (!log) {
@@ -846,7 +1057,13 @@
                     log.appendChild(item);
                 }
                 
-                console.log(`Loaded ${packets.length} historical packets`);
+                if (!loadPackets._loggedOnce) {
+                    console.log(`Loaded ${packets.length} historical packets`);
+                    loadPackets._loggedOnce = true;
+                }
+
+                // Also rebuild chart packet markers from polled history.
+                rebuildPacketMarkersFromPackets(lastPacketsCache);
             } catch (e) {
                 console.error('Failed to load packets', e);
             }
@@ -854,11 +1071,21 @@
         
         // Periodic updates
         setInterval(loadStations, 5000);
+        // Packet updates normally come from Socket.IO (new_packet). On networks/devices
+        // where websockets/polling is flaky, this keeps packets + yellow markers alive.
+        setInterval(loadPackets, 5000);
         setInterval(async () => {
-            const response = await fetch('/api/stats');
-            const stats = await response.json();
-            updatePipelineStatus(stats.pipeline_running);
+            try {
+                const response = await apiFetch('api/stats');
+                const stats = await response.json();
+                updatePipelineStatus(stats.pipeline_running);
+            } catch (e) {
+                // Ignore transient network errors.
+            }
         }, 2000);
+
+        // Fallback poller for RSSI chart (only kicks in if Socket.IO stalls).
+        setInterval(pollContinuousRssiFallback, 1000);
         
         // Initial load
         function updateGainInfo() {
@@ -883,7 +1110,7 @@
 
         async function loadPreset(device) {
             try {
-                const response = await fetch(`/api/preset/${device}`);
+                const response = await apiFetch(`api/preset/${device}`);
                 if (!response.ok) {
                     console.log(`No preset found for ${device}`);
                     return false;
@@ -916,7 +1143,7 @@
 
         async function loadConfig() {
             try {
-                const response = await fetch('/api/config');
+                const response = await apiFetch('api/config');
                 const cfg = await response.json();
                 const device = cfg.device || 'rtlsdr';
                 document.getElementById('device').value = device;
@@ -947,6 +1174,25 @@
         loadConfig();
         loadStations();
         loadPackets();
+
+        // Mobile browsers aggressively throttle timers in the background. When the tab
+        // becomes visible again, force a resync so the UI doesn't look "stuck".
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState !== 'visible') return;
+            dbg('visibilitychange -> visible; forcing resync');
+            try { lastContinuousRssiAt = 0; } catch (_) { /* ignore */ }
+            loadStations();
+            loadPackets();
+        });
+
+        // Optional periodic debug heartbeat (prints last-update ages).
+        if (DEBUG) {
+            setInterval(() => {
+                const now = Date.now();
+                const age = (t) => (t ? (now - t) : NaN);
+                dbg('ages(ms): rssi=', age(lastContinuousRssiAt), 'new_packet=', age(lastNewPacketAt), 'stats_update=', age(lastStatsAt), 'packets_poll=', age(lastPacketsPollAt));
+            }, 5000);
+        }
     </script>
 </body>
 </html>
