@@ -2,7 +2,11 @@
 
 ### Overview
 
-I decided to build a complete APRS RX-TX with a good demodulator and packet decoder and a WEB interface to monitor RX performances.
+I decided to build a complete APRS RX-TX with:
+- a good demodulator
+- an accurate RSSI and SNR measurement (before the FM demodulator)
+- a packet decoder based on Direwolf
+- a WEB interface to monitor RX performances in a easy way
 
 
 ## New Features vs original Direwolf
